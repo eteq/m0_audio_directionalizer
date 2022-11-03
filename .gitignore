@@ -1,2 +1,4 @@
 /target
 Cargo.lock
+toflash.bin
+toflash.uf2
