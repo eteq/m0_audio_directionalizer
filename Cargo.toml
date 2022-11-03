@@ -5,13 +5,18 @@ edition = "2021"
 
 [dependencies]
 
-circuit_playground_express = "0.11.0"
-
+circuit_playground_express = { git = "https://github.com/atsamd-rs/atsamd", features = ["unproven"]}
 panic-halt = "0.2"
-panic-semihosting = "0.5"
-usbd-serial = "0.1"
+#panic-semihosting = "0.5"
 smart-leds = "0.3.0"
+
+
 
 [dependencies.ws2812-timer-delay]
 features = ["slow"]
 version = "0.3.0"
+
+
+
+[package.metadata]
+chip = "ATSAMD21G18A"
