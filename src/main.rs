@@ -1,13 +1,6 @@
 #![no_std]
 #![no_main]
 
-// Neopixel Rainbow
-// This only functions when the --release version is compiled. Using the debug
-// version leads to slow pulse durations which results in a straight white LED
-// output.
-//
-// // Needs to be compiled with --release for the timing to be correct
-
 #[cfg(not(feature = "use_semihosting"))]
 use panic_halt as _;
 #[cfg(feature = "use_semihosting")]
@@ -31,6 +24,8 @@ use smart_leds::{
     SmartLedsWrite,
 };
 use ws2812_timer_delay as ws2812;
+
+// adjusts hue in response to the two analog inputs
 
 #[entry]
 fn main() -> ! {
