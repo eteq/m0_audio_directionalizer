@@ -20,6 +20,7 @@ use hal::timer::TimerCounter;
 use pac::{CorePeripherals, Peripherals};
 
 use smart_leds::{
+    RGB,
     hsv::{hsv2rgb, Hsv},
     SmartLedsWrite,
 };
@@ -45,6 +46,11 @@ fn main() -> ! {
     let mut timer = TimerCounter::tc3_(&timer_clock, peripherals.TC3, &mut peripherals.PM);
     timer.start(3.mhz());
 
+
+    // disable the speaker on startup
+    let mut speaker_enable = pins.d11.into_push_pull_output();
+    speaker_enable.set_low().expect("couldn't turn off speaker!");
+
     let neopixel_pin: bsp::NeoPixel = pins.d8.into();
     let mut neopixel = ws2812::Ws2812::new(timer, neopixel_pin);
 
@@ -58,28 +64,30 @@ fn main() -> ! {
 
         let data1: u16 = adc.read(&mut a1).unwrap();
         let hue1: u8 = (data1 *15 / 360).try_into().unwrap();  
-        let rgb1 = hsv2rgb(Hsv {
-            hue: hue1,
-            sat: 255,
-            val: 2,
-        });
-
         let data2: u16 = adc.read(&mut a2).unwrap();
         let hue2: u8 = (data2 *15 / 360).try_into().unwrap();  
-        let rgb2= hsv2rgb(Hsv {
-            hue: hue2,
-            sat: 255,
-            val: 2,
-        });
         
         
-        let mut colors = [rgb1; 10];
-        for i in 0..3 { colors[i] = rgb2; }
-        for i in 8..10 { colors[i] = rgb2; }
+        let mut hues = [hue1; 10];
+        for i in 0..3 { hues[i] = hue2; }
+        for i in 8..10 { hues[i] = hue2; }
 
-        neopixel.write(colors.iter().cloned()).unwrap();
+        neopixel_hue(&mut neopixel, &hues, 255, 2).expect("couldn't write to neopixel");
         delay.delay_ms(100u16);
     }
 }
 
+fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; 10], sat: u8, val: u8) -> Result<(), S::Error>
+    where <S as SmartLedsWrite>::Color: From<RGB<u8>> {
 
+    let rgbarr: [RGB<u8>; 10] = core::array::from_fn( |i| {
+        hsv2rgb(Hsv {
+            hue: huearr[i],
+            sat: sat,
+            val: val,
+        })
+    });
+
+    neopixel.write(rgbarr.iter().cloned())
+
+}
