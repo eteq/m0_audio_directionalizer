@@ -1,10 +1,11 @@
 #![no_std]
 #![no_main]
 
-#[cfg(not(feature = "use_semihosting"))]
+#[cfg(feature = "use_halt")]
 use panic_halt as _;
 #[cfg(feature = "use_semihosting")]
 use panic_semihosting as _;
+use panic_persist;
 
 use bsp::hal;
 use bsp::pac;
@@ -51,6 +52,24 @@ fn main() -> ! {
     timer.start(3.mhz());
 
 
+    // Setup UART peripheral.
+    let (rx_pin, tx_pin) = (pins.a6, pins.a7);
+    let mut uart = bsp::uart(
+        &mut clocks,
+        115200.hz(),
+        peripherals.SERCOM4,
+        &mut peripherals.PM,
+        rx_pin,
+        tx_pin,
+    );
+
+
+    // Check if there was a panic message, if so, send to UART
+    if let Some(msg) = panic_persist::get_panic_message_bytes() {
+        write_message(&mut uart, msg);
+    }
+
+
     // disable the speaker on startup
     let mut speaker_enable = pins.d11.into_push_pull_output();
     speaker_enable.set_low().expect("couldn't turn off speaker!");
@@ -62,26 +81,15 @@ fn main() -> ! {
     // let mut adc = Adc::adc(peripherals.ADC, &mut peripherals.PM, &mut clocks);
     // let mut a1 : hal::gpio::v2::Pin<hal::gpio::v2::pin::PA05, hal::gpio::v2::Alternate<hal::gpio::v2::B>> = pins.a1.into();
     // let mut a2 : hal::gpio::v2::Pin<hal::gpio::v2::pin::PA06, hal::gpio::v2::Alternate<hal::gpio::v2::B>> = pins.a2.into();
-    neopixel_hue(&mut neopixel, &[10_u8; 10], 255, 2).expect("failed to start neopixels");
-
-
-    let mut _speaker_out: pin::Pin<_, pin::AlternateB> = pins.a0.into_alternate();
-    let mut dac = peripherals.DAC;
-    init_dac(&mut dac, &mut peripherals.PM, &mut clocks);
-    //speaker_enable.set_high().expect("couldn't turn on speaker!");
+    neopixel_hue(&mut neopixel, &[30_u8; 10], 255, 2).expect("failed to start neopixels");
 
     
+        // Write out a message on start up.
     
-    let mut i = 0;
-    loop {
-        let val_10bit = 0x2f * (i%2);//(val * (0x3ff as f32)) as u16;
-
-        while dac.status.read().syncbusy().bit_is_set() {}
-        dac.data.write(|w| unsafe { w.bits(val_10bit) });
-        
-        delay.delay_us(800_u16); 
-        i += 1;
-    }
+        loop {
+            write_message(&mut uart, b"blork!");
+            delay.delay_ms(500u16);
+        }
 }
 
 fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; 10], sat: u8, val: u8) -> Result<(), S::Error>
@@ -99,26 +107,12 @@ fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; 10], sat: u8,
 
 }
 
-fn init_dac(dac: &mut DAC, pm: &mut PM, clocks: &mut GenericClockController) {
-    pm.apbcmask.modify(|_, w| w.dac_().set_bit());
+fn write_message(uart: &mut bsp::Uart, msg: &[u8]) {
 
-    let gclk0 = clocks.gclk0();
-    clocks.dac(&gclk0).expect("dac clock setup failed");
-    while dac.status.read().syncbusy().bit_is_set() {}
+    for byte in msg {
+        nb::block!(uart.write(*byte)).expect("uart writing failed");
+    }
 
-    // reset because you never know...
-    dac.ctrla.modify(|_, w| w.swrst().set_bit());
-    while dac.status.read().syncbusy().bit_is_set() {}
-
-
-    dac.ctrlb.modify(|_, w| {
-        w.eoen().set_bit();
-        w.refsel().int1v()
-    });
-    while dac.status.read().syncbusy().bit_is_set() {}
-
-
-    // enable
-    dac.ctrla.modify(|_, w| w.enable().set_bit());
-    while dac.status.read().syncbusy().bit_is_set() {}
+    nb::block!(uart.write('\r' as u8)).expect("uart writing failed");
+    nb::block!(uart.write('\n' as u8)).expect("uart writing failed");
 }

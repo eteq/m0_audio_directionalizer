@@ -6,8 +6,9 @@ edition = "2021"
 [dependencies]
 
 circuit_playground_express = { git = "https://github.com/atsamd-rs/atsamd", features = ["unproven"]}
-panic-halt = "0.2"
+#panic-halt = "0.2"
 #panic-semihosting = "0.5"
+panic-persist = "0.3.0"
 smart-leds = "0.3.0"
 libm = "0.2.6"
 
