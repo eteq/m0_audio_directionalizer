@@ -66,7 +66,13 @@ fn main() -> ! {
 
     // Check if there was a panic message, if so, send to UART
     if let Some(msg) = panic_persist::get_panic_message_bytes() {
-        write_message(&mut uart, msg);
+        loop {
+            for byte in msg {
+                nb::block!(uart.write(*byte)).ok();
+            }
+            write_message(&mut uart, b"\rreset to stop showing this");
+            delay.delay_ms(1000u16);
+        }
     }
 
 
@@ -89,6 +95,9 @@ fn main() -> ! {
         loop {
             write_message(&mut uart, b"blork!");
             delay.delay_ms(500u16);
+            write_message(&mut uart, b"blork!");
+            delay.delay_ms(500u16);
+            panic!("arg");
         }
 }
 
