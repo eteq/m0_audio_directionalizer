@@ -26,7 +26,7 @@ use smart_leds::{
 use ws2812_timer_delay as ws2812;
 
 use nb::block;
-//use numtoa::NumToA;
+use numtoa::NumToA;
 
 // adjusts hue in response to the two analog inputs
 
@@ -98,27 +98,45 @@ fn main() -> ! {
         pins.flash_miso, 
         pins.flash_cs);
 
-        let mut buffer = [0_u8; 3];
-        flash_read(&mut flash_spi, &mut flash_cs, 0x9f as u8, -1, &mut buffer);
-        if buffer[0] != 0x01 || buffer[1] != 0x40 || buffer[2] != 0x15 {
+        let mut idbuffer = [0u8; 3];
+        flash_read(&mut flash_spi, &mut flash_cs, 0x9f as u8, -1, &mut idbuffer);
+        if idbuffer[0] != 0x01 || idbuffer[1] != 0x40 || idbuffer[2] != 0x15 {
             panic!("Failed to read ID info from flash chip!");
         }
 
+        let mut numtoascratch = [0u8; 20];
+        let mut flashdata = [0u8; 3];
+        flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut flashdata);
+        write_message(&mut uart, b"pre-buffer:");
+        for i in 0..flashdata.len() {write_message(&mut uart, flashdata[i].numtoa(16, &mut numtoascratch));}
+
     // clear the whole flash chip
     flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1);  // Write enable
-    flash_command(&mut flash_spi, &mut flash_cs, 0x60, -1);  // Chip Erase
+    flash_command(&mut flash_spi, &mut flash_cs, 0x20, 0);  // Erase sector 0
+    //flash_command(&mut flash_spi, &mut flash_cs, 0x60, 0); //chip erase
 
-    let mut srbuf = [1u8; 1];
-
-    while srbuf[0] & 1 == 1 {
-        flash_read(&mut flash_spi, &mut flash_cs, 0x05, -1, &mut srbuf);
-        if srbuf[0] & 1 == 1 {
-            write_message(&mut uart, b"Still erasing...");
-            delay.delay_ms(250u16);
-        } else {
-            write_message(&mut uart, b"Not busy, done erasing.");
-        }
+    while is_flash_busy(&mut flash_spi, &mut flash_cs) {
+        write_message(&mut uart, b"flash is busy erasing...");
+        delay.delay_ms(250u16);
     }
+    write_message(&mut uart, b"flash erased!");
+
+
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut flashdata);
+    write_message(&mut uart, b"data now:");
+    for i in 0..flashdata.len() {write_message(&mut uart, flashdata[i].numtoa(16, &mut numtoascratch));}
+
+    
+    flash_write_page(&mut flash_spi, &mut flash_cs, 0, &[10, 11, 12]);
+
+    while is_flash_busy(&mut flash_spi, &mut flash_cs) {
+        write_message(&mut uart, b"flash is busy...");
+        delay.delay_ms(50u16);
+    }
+
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut flashdata);
+    write_message(&mut uart, b"data post-write:");
+    for i in 0..flashdata.len() {write_message(&mut uart, flashdata[i].numtoa(16, &mut numtoascratch));}
 
 
     loop {
@@ -128,6 +146,7 @@ fn main() -> ! {
         delay.delay_ms(500u16);
     }
 }
+
 
 fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; 10], sat: u8, val: u8) -> Result<(), S::Error>
     where <S as SmartLedsWrite>::Color: From<RGB<u8>> {
@@ -144,6 +163,7 @@ fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; 10], sat: u8,
 
 }
 
+
 fn write_message(uart: &mut bsp::Uart, msg: &[u8]) {
 
     for byte in msg {
@@ -153,6 +173,7 @@ fn write_message(uart: &mut bsp::Uart, msg: &[u8]) {
     block!(uart.write('\r' as u8)).expect("uart writing failed");
     block!(uart.write('\n' as u8)).expect("uart writing failed");
 }
+
 
 // this is the same as what's in the BSP but down-rated a bit on the speed because the default 48 MHz didn't work...
 fn flash_spi_master2(
@@ -179,40 +200,76 @@ fn flash_spi_master2(
     (spi, cs)
 }
 
+
 fn flash_read(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, command: u8, address: i32, outbuffer: &mut[u8]) {
     // negative address means no address, as addresses are only 24 bit
 
     flash_cs.set_low().expect("failed to set flash cs pin high");
 
-    flash_spi.send(command).expect("flash send failed");
+    block!(flash_spi.send(command)).expect("flash send failed");
     block!(flash_spi.read()).expect("flash read failed");
-    if address > 0 {
+    if address >= 0 {
         for i in (0..3).rev() {
             let offset = i*8;
-            flash_spi.send(((address >> offset) & 0xff) as u8).expect("flash send failed");
+            block!(flash_spi.send(((address >> offset) & 0xff) as u8)).expect("flash send failed");
             block!(flash_spi.read()).expect("flash read failed");
         }
     }
 
     for i in 0..outbuffer.len() {
-        flash_spi.send(1).expect("flash send failed");
+        block!(flash_spi.send(1)).expect("flash send failed");
         outbuffer[i] = block!(flash_spi.read()).expect("flash read failed");
     }
+
     flash_cs.set_high().expect("failed to set flash cs pin high");
 }
+
 
 fn flash_command(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, command: u8, address: i32) {
     // negative address means no address, as addresses are only 24 bit
 
     flash_cs.set_low().expect("failed to set flash cs pin high");
 
-    flash_spi.send(command).expect("flash send failed");
-    if address > 0 {
+    block!(flash_spi.send(command)).expect("flash send failed");
+    block!(flash_spi.read()).expect("flash read failed"); // consume
+    if address >= 0 {
         for i in (0..3).rev() {
             let offset = i*8;
-            flash_spi.send(((address >> offset) & 0xff) as u8).expect("flash send failed");
+            block!(flash_spi.send(((address >> offset) & 0xff) as u8)).expect("flash send failed");
+            block!(flash_spi.read()).expect("flash read failed"); // consume
         }
     }
 
+    flash_cs.set_high().expect("failed to set flash cs pin high");
+}
+
+
+fn is_flash_busy(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs) -> bool{
+    let mut buf = [0; 1];
+    flash_read(flash_spi, flash_cs, 0x05, -1, &mut buf);
+    (buf[0] & 1) == 1
+}
+
+
+fn flash_write_page(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, address: i32, towrite: &[u8]) {
+    if address < 0 { panic!("must give a non-negative address for writing!"); }
+    if towrite.len() < 1 || towrite.len() > 256 { panic!("page must be 0 to 256 bytes!");}
+    
+    flash_command(flash_spi, flash_cs, 0x06, -1);  // write enable
+    
+    flash_cs.set_low().expect("failed to set flash cs pin high");
+
+    block!(flash_spi.send(0x02)).expect("flash send failed");
+    block!(flash_spi.read()).expect("flash read failed"); // consume
+    for i in (0..3).rev() {
+        let offset = i*8;
+        block!(flash_spi.send(((address >> offset) & 0xff) as u8)).expect("flash send failed");
+        block!(flash_spi.read()).expect("flash read failed"); // consume
+    }
+    for i in 0..towrite.len() {
+        block!(flash_spi.send(towrite[i])).expect("flash send failed");
+        block!(flash_spi.read()).expect("flash read failed"); // consume
+
+    }
     flash_cs.set_high().expect("failed to set flash cs pin high");
 }
