@@ -17,9 +17,10 @@ use hal::clock::GenericClockController;
 use hal::delay::Delay;
 use hal::prelude::*;
 use hal::timer::TimerCounter;
-use hal::gpio::v2::pin;
+use hal::sercom::v2::spi;
+use hal::time::MegaHertz;
 
-use pac::{CorePeripherals, Peripherals, PM, DAC};
+use pac::{CorePeripherals, Peripherals};
 
 use smart_leds::{
     RGB,
@@ -28,7 +29,8 @@ use smart_leds::{
 };
 use ws2812_timer_delay as ws2812;
 
-use libm;
+use nb::block;
+use numtoa::NumToA;
 
 // adjusts hue in response to the two analog inputs
 
@@ -53,14 +55,13 @@ fn main() -> ! {
 
 
     // Setup UART peripheral.
-    let (rx_pin, tx_pin) = (pins.a6, pins.a7);
     let mut uart = bsp::uart(
         &mut clocks,
         115200.hz(),
         peripherals.SERCOM4,
         &mut peripherals.PM,
-        rx_pin,
-        tx_pin,
+        pins.a6,
+        pins.a7,
     );
 
 
@@ -68,7 +69,7 @@ fn main() -> ! {
     if let Some(msg) = panic_persist::get_panic_message_bytes() {
         loop {
             for byte in msg {
-                nb::block!(uart.write(*byte)).ok();
+                block!(uart.write(*byte)).ok();
             }
             write_message(&mut uart, b"\rreset to stop showing this");
             delay.delay_ms(1000u16);
@@ -89,16 +90,32 @@ fn main() -> ! {
     // let mut a2 : hal::gpio::v2::Pin<hal::gpio::v2::pin::PA06, hal::gpio::v2::Alternate<hal::gpio::v2::B>> = pins.a2.into();
     neopixel_hue(&mut neopixel, &[30_u8; 10], 255, 2).expect("failed to start neopixels");
 
-    
-        // Write out a message on start up.
-    
-        loop {
-            write_message(&mut uart, b"blork!");
-            delay.delay_ms(500u16);
-            write_message(&mut uart, b"blork!");
-            delay.delay_ms(500u16);
-            panic!("arg");
+
+
+    //set up SPI for flash - defaults to 48 MHz and mode=0, which is fine for the flash chip
+    let (mut flash_spi, mut flash_cs) = flash_spi_master2(
+        &mut clocks, 
+        peripherals.SERCOM3, 
+        &mut peripherals.PM, 
+        pins.flash_sck, 
+        pins.flash_mosi, 
+        pins.flash_miso, 
+        pins.flash_cs);
+
+        let mut buffer = [0_u8; 3];
+        flash_read(&mut flash_spi, &mut flash_cs, 0x9f as u8, -1, &mut buffer);
+        if buffer[0] != 0x01 || buffer[1] != 0x40 || buffer[2] != 0x15 {
+            panic!("Failed to read ID info from flash chip!");
         }
+
+
+
+    loop {
+        neopixel_hue(&mut neopixel, &[85_u8; 10], 255, 2).expect("failed to start neopixels");
+        delay.delay_ms(500u16);
+        neopixel_hue(&mut neopixel, &[190_u8; 10], 255, 2).expect("failed to start neopixels");
+        delay.delay_ms(500u16);
+    }
 }
 
 fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; 10], sat: u8, val: u8) -> Result<(), S::Error>
@@ -119,9 +136,88 @@ fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; 10], sat: u8,
 fn write_message(uart: &mut bsp::Uart, msg: &[u8]) {
 
     for byte in msg {
-        nb::block!(uart.write(*byte)).expect("uart writing failed");
+        block!(uart.write(*byte)).expect("uart writing failed");
     }
 
-    nb::block!(uart.write('\r' as u8)).expect("uart writing failed");
-    nb::block!(uart.write('\n' as u8)).expect("uart writing failed");
+    block!(uart.write('\r' as u8)).expect("uart writing failed");
+    block!(uart.write('\n' as u8)).expect("uart writing failed");
+}
+
+fn write_byte_buffer(uart: &mut bsp::Uart, buffer: &[u8]) {
+    for i in 0..buffer.len() {
+        for j in 0..8 {
+            let bit;
+            if (buffer[i] << j & 0x80) == 0x80 {
+                bit = '1' as u8;
+            } else {
+                bit = '0' as u8;
+            }
+            block!(uart.write(bit)).expect("uart writing failed");
+        }
+        block!(uart.write('\r' as u8)).expect("uart writing failed");
+        block!(uart.write('\n' as u8)).expect("uart writing failed");
+    }
+}
+
+// this is the same as what's in the BSP but down-rated a bit on the speed because the default 48 MHz didn't work...
+fn flash_spi_master2(
+    clocks: &mut GenericClockController,
+    sercom3: pac::SERCOM3,
+    pm: &mut pac::PM,
+    sck: impl Into<bsp::FlashSck>,
+    mosi: impl Into<bsp::FlashMosi>,
+    miso: impl Into<bsp::FlashMiso>,
+    cs: impl Into<bsp::FlashCs>,
+) -> (bsp::FlashSpi, bsp::FlashCs) {
+    let gclk0 = clocks.gclk0();
+    let clock = clocks.sercom3_core(&gclk0).unwrap();
+    let freq = clock.freq();
+    let (sck, mosi, miso, mut cs) = (sck.into(), mosi.into(), miso.into(), cs.into());
+    let pads = spi::Pads::default().data_in(miso).data_out(mosi).sclk(sck);
+    let spi = spi::Config::new(pm, sercom3, pads, freq)
+        .baud(MegaHertz(10))
+        .spi_mode(spi::MODE_0)
+        .enable();
+
+    cs.set_high().unwrap();
+
+    (spi, cs)
+}
+
+fn flash_read(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, command: u8, address: i32, outbuffer: &mut[u8]) {
+    // negative address means no address, as addresses are only 24 bit
+
+    flash_cs.set_low().expect("failed to set flash cs pin high");
+
+    flash_spi.send(command).expect("flash send failed");
+    block!(flash_spi.read()).expect("flash read failed");
+    if address > 0 {
+        for i in (0..3).rev() {
+            let offset = i*8;
+            flash_spi.send(((address >> offset) & 0xff) as u8).expect("flash send failed");
+            block!(flash_spi.read()).expect("flash read failed");
+        }
+    }
+
+    for i in 0..outbuffer.len() {
+        flash_spi.send(1).expect("flash send failed");
+        outbuffer[i] = block!(flash_spi.read()).expect("flash read failed");
+    }
+    flash_cs.set_high().expect("failed to set flash cs pin high");
+}
+
+fn flash_command(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, command: u8, address: i32) {
+    // negative address means no address, as addresses are only 24 bit
+
+    flash_cs.set_low().expect("failed to set flash cs pin high");
+
+    flash_spi.send(command).expect("flash send failed");
+    if address > 0 {
+        for i in (0..3).rev() {
+            let offset = i*8;
+            flash_spi.send(((address >> offset) & 0xff) as u8).expect("flash send failed");
+        }
+    }
+
+    flash_cs.set_high().expect("failed to set flash cs pin high");
 }

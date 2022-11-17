@@ -11,6 +11,7 @@ circuit_playground_express = { git = "https://github.com/atsamd-rs/atsamd", feat
 panic-persist = "0.3.0"
 smart-leds = "0.3.0"
 libm = "0.2.6"
+numtoa = "0.2.4"
 
 
 
