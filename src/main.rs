@@ -1,10 +1,6 @@
 #![no_std]
 #![no_main]
 
-#[cfg(feature = "use_halt")]
-use panic_halt as _;
-#[cfg(feature = "use_semihosting")]
-use panic_semihosting as _;
 use panic_persist;
 
 use bsp::hal;
@@ -12,7 +8,7 @@ use bsp::pac;
 use circuit_playground_express as bsp;
 
 use bsp::entry;
-use hal::adc::Adc;
+//use hal::adc::Adc;
 use hal::clock::GenericClockController;
 use hal::delay::Delay;
 use hal::prelude::*;
@@ -30,7 +26,7 @@ use smart_leds::{
 use ws2812_timer_delay as ws2812;
 
 use nb::block;
-use numtoa::NumToA;
+//use numtoa::NumToA;
 
 // adjusts hue in response to the two analog inputs
 
@@ -108,6 +104,21 @@ fn main() -> ! {
             panic!("Failed to read ID info from flash chip!");
         }
 
+    // clear the whole flash chip
+    flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1);  // Write enable
+    flash_command(&mut flash_spi, &mut flash_cs, 0x60, -1);  // Chip Erase
+
+    let mut srbuf = [1u8; 1];
+
+    while srbuf[0] & 1 == 1 {
+        flash_read(&mut flash_spi, &mut flash_cs, 0x05, -1, &mut srbuf);
+        if srbuf[0] & 1 == 1 {
+            write_message(&mut uart, b"Still erasing...");
+            delay.delay_ms(250u16);
+        } else {
+            write_message(&mut uart, b"Not busy, done erasing.");
+        }
+    }
 
 
     loop {
@@ -141,22 +152,6 @@ fn write_message(uart: &mut bsp::Uart, msg: &[u8]) {
 
     block!(uart.write('\r' as u8)).expect("uart writing failed");
     block!(uart.write('\n' as u8)).expect("uart writing failed");
-}
-
-fn write_byte_buffer(uart: &mut bsp::Uart, buffer: &[u8]) {
-    for i in 0..buffer.len() {
-        for j in 0..8 {
-            let bit;
-            if (buffer[i] << j & 0x80) == 0x80 {
-                bit = '1' as u8;
-            } else {
-                bit = '0' as u8;
-            }
-            block!(uart.write(bit)).expect("uart writing failed");
-        }
-        block!(uart.write('\r' as u8)).expect("uart writing failed");
-        block!(uart.write('\n' as u8)).expect("uart writing failed");
-    }
 }
 
 // this is the same as what's in the BSP but down-rated a bit on the speed because the default 48 MHz didn't work...
