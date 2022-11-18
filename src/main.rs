@@ -110,41 +110,69 @@ fn main() -> ! {
         write_message(&mut uart, b"pre-buffer:");
         for i in 0..flashdata.len() {write_message(&mut uart, flashdata[i].numtoa(16, &mut numtoascratch));}
 
-    // clear the whole flash chip
-    flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1);  // Write enable
-    flash_command(&mut flash_spi, &mut flash_cs, 0x20, 0);  // Erase sector 0
-    //flash_command(&mut flash_spi, &mut flash_cs, 0x60, 0); //chip erase
-
-    while is_flash_busy(&mut flash_spi, &mut flash_cs) {
-        write_message(&mut uart, b"flash is busy erasing...");
-        delay.delay_ms(250u16);
-    }
-    write_message(&mut uart, b"flash erased!");
-
-
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut flashdata);
-    write_message(&mut uart, b"data now:");
-    for i in 0..flashdata.len() {write_message(&mut uart, flashdata[i].numtoa(16, &mut numtoascratch));}
-
-    
-    flash_write_page(&mut flash_spi, &mut flash_cs, 0, &[10, 11, 12]);
-
-    while is_flash_busy(&mut flash_spi, &mut flash_cs) {
-        write_message(&mut uart, b"flash is busy...");
-        delay.delay_ms(50u16);
-    }
-
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut flashdata);
-    write_message(&mut uart, b"data post-write:");
-    for i in 0..flashdata.len() {write_message(&mut uart, flashdata[i].numtoa(16, &mut numtoascratch));}
-
-    write_message(&mut uart, b"erasing whole chip");
     
     flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1);  // Write enable
-    flash_command(&mut flash_spi, &mut flash_cs, 0x60, -1); //chip erase
-    let cycles = wait_for_flash(&mut flash_spi, &mut flash_cs);
+    flash_command(&mut flash_spi, &mut flash_cs, 0xD8, 0);  // Erase block 0
+    let n = wait_for_flash(&mut flash_spi, &mut flash_cs);
+    write_message(&mut uart, b"block erase took this many cycles:");
+    write_message(&mut uart, n.numtoa(10, &mut numtoascratch));
 
-    write_message(&mut uart, cycles.numtoa(10, &mut numtoascratch));
+    let mut outbuff = [0u8; 4];
+
+    write_message(&mut uart, b"pre addr 0:");
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut outbuff);
+    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
+
+    write_message(&mut uart, b"pre addr 1:");
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 1, &mut outbuff);
+    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
+
+    write_message(&mut uart, b"pre addr 256:");
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 256, &mut outbuff);
+    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
+
+    let buf1 = [1, 2, 3u8];
+    let buf2 = [4, 5, 6u8];
+    let buf3 = [7, 8, 9u8];
+
+    flash_write_page(&mut flash_spi, &mut flash_cs, 3, &buf2);
+    flash_write_page(&mut flash_spi, &mut flash_cs, 0, &buf1);
+    flash_write_page(&mut flash_spi, &mut flash_cs, 256, &buf3);
+    
+
+    let m = wait_for_flash(&mut flash_spi, &mut flash_cs);
+    write_message(&mut uart, b"write took this many cycles:");
+    write_message(&mut uart, m.numtoa(10, &mut numtoascratch));
+
+    write_message(&mut uart, b"post addr 0:");
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut outbuff);
+    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
+
+    write_message(&mut uart, b"post addr 1:");
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 1, &mut outbuff);
+    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
+
+    write_message(&mut uart, b"post addr 256:");
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 256, &mut outbuff);
+    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
+
+
+    flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1);  // Write enable
+    flash_command(&mut flash_spi, &mut flash_cs, 0x20, 0x1000);  // Erase sector 1
+    let n = wait_for_flash(&mut flash_spi, &mut flash_cs);
+
+    write_message(&mut uart, b"postpost addr 0:");
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut outbuff);
+    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
+
+    write_message(&mut uart, b"postpost addr 1:");
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 1, &mut outbuff);
+    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
+
+    write_message(&mut uart, b"postpost addr 256:");
+    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 256, &mut outbuff);
+    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
+
 
     loop {
         neopixel_hue(&mut neopixel, &[85_u8; 10], 255, 2).expect("failed to start neopixels");
@@ -210,6 +238,7 @@ fn flash_spi_master2(
 
 fn flash_read(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, command: u8, address: i32, outbuffer: &mut[u8]) {
     // negative address means no address, as addresses are only 24 bit
+    // addresses are byte-addresses
 
     flash_cs.set_low().expect("failed to set flash cs pin high");
 
@@ -280,6 +309,7 @@ fn wait_for_flash(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs) ->
 
 
 fn flash_write_page(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, address: i32, towrite: &[u8]) {
+    // addresses are byte-addresses
     if address < 0 { panic!("must give a non-negative address for writing!"); }
     if towrite.len() < 1 || towrite.len() > 256 { panic!("page must be 0 to 256 bytes!");}
     
