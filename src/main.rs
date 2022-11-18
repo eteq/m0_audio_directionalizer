@@ -138,6 +138,13 @@ fn main() -> ! {
     write_message(&mut uart, b"data post-write:");
     for i in 0..flashdata.len() {write_message(&mut uart, flashdata[i].numtoa(16, &mut numtoascratch));}
 
+    write_message(&mut uart, b"erasing whole chip");
+    
+    flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1);  // Write enable
+    flash_command(&mut flash_spi, &mut flash_cs, 0x60, -1); //chip erase
+    let cycles = wait_for_flash(&mut flash_spi, &mut flash_cs);
+
+    write_message(&mut uart, cycles.numtoa(10, &mut numtoascratch));
 
     loop {
         neopixel_hue(&mut neopixel, &[85_u8; 10], 255, 2).expect("failed to start neopixels");
@@ -248,6 +255,27 @@ fn is_flash_busy(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs) -> 
     let mut buf = [0; 1];
     flash_read(flash_spi, flash_cs, 0x05, -1, &mut buf);
     (buf[0] & 1) == 1
+}
+
+
+fn wait_for_flash(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs) -> u32 {
+
+    flash_cs.set_low().expect("failed to set flash cs pin high");
+
+    block!(flash_spi.send(0x05)).expect("flash send failed");
+    block!(flash_spi.read()).expect("flash read failed");
+
+    let mut i = -1i32;
+    let mut status = 1u8;
+    while (status & 1) == 1 {
+        block!(flash_spi.send(0x05)).expect("flash send failed");
+        status = block!(flash_spi.read()).expect("flash read failed");
+        i += 1;
+    }
+
+    flash_cs.set_high().expect("failed to set flash cs pin high");
+
+    i as u32
 }
 
 
