@@ -77,6 +77,11 @@ fn main() -> ! {
     let mut speaker_enable = pins.d11.into_push_pull_output();
     speaker_enable.set_low().expect("couldn't turn off speaker!");
 
+    // set up the input pins
+    let left_button = pins.d4.into_pull_down_input(); // 1 is pressed
+    let right_button = pins.d5.into_pull_down_input(); // 1 is pressed
+    let slide_switch = pins.d7.into_pull_up_input(); //1 is pointing to left
+
     let neopixel_pin: bsp::NeoPixel = pins.d8.into();
     let mut neopixel = ws2812::Ws2812::new(timer, neopixel_pin);
 
@@ -85,8 +90,6 @@ fn main() -> ! {
     // let mut a1 : hal::gpio::v2::Pin<hal::gpio::v2::pin::PA05, hal::gpio::v2::Alternate<hal::gpio::v2::B>> = pins.a1.into();
     // let mut a2 : hal::gpio::v2::Pin<hal::gpio::v2::pin::PA06, hal::gpio::v2::Alternate<hal::gpio::v2::B>> = pins.a2.into();
     neopixel_hue(&mut neopixel, &[30_u8; 10], 255, 2).expect("failed to start neopixels");
-
-
 
     //set up SPI for flash - defaults to 48 MHz and mode=0, which is fine for the flash chip
     let (mut flash_spi, mut flash_cs) = flash_spi_master2(
@@ -104,75 +107,9 @@ fn main() -> ! {
             panic!("Failed to read ID info from flash chip!");
         }
 
-        let mut numtoascratch = [0u8; 20];
-        let mut flashdata = [0u8; 3];
-        flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut flashdata);
-        write_message(&mut uart, b"pre-buffer:");
-        for i in 0..flashdata.len() {write_message(&mut uart, flashdata[i].numtoa(16, &mut numtoascratch));}
-
+        //let mut numtoascratch = [0u8; 20];
+        //val.numtoa(16, &mut numtoascratch);
     
-    flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1);  // Write enable
-    flash_command(&mut flash_spi, &mut flash_cs, 0xD8, 0);  // Erase block 0
-    let n = wait_for_flash(&mut flash_spi, &mut flash_cs);
-    write_message(&mut uart, b"block erase took this many cycles:");
-    write_message(&mut uart, n.numtoa(10, &mut numtoascratch));
-
-    let mut outbuff = [0u8; 4];
-
-    write_message(&mut uart, b"pre addr 0:");
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut outbuff);
-    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
-
-    write_message(&mut uart, b"pre addr 1:");
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 1, &mut outbuff);
-    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
-
-    write_message(&mut uart, b"pre addr 256:");
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 256, &mut outbuff);
-    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
-
-    let buf1 = [1, 2, 3u8];
-    let buf2 = [4, 5, 6u8];
-    let buf3 = [7, 8, 9u8];
-
-    flash_write_page(&mut flash_spi, &mut flash_cs, 3, &buf2);
-    flash_write_page(&mut flash_spi, &mut flash_cs, 0, &buf1);
-    flash_write_page(&mut flash_spi, &mut flash_cs, 256, &buf3);
-    
-
-    let m = wait_for_flash(&mut flash_spi, &mut flash_cs);
-    write_message(&mut uart, b"write took this many cycles:");
-    write_message(&mut uart, m.numtoa(10, &mut numtoascratch));
-
-    write_message(&mut uart, b"post addr 0:");
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut outbuff);
-    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
-
-    write_message(&mut uart, b"post addr 1:");
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 1, &mut outbuff);
-    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
-
-    write_message(&mut uart, b"post addr 256:");
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 256, &mut outbuff);
-    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
-
-
-    flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1);  // Write enable
-    flash_command(&mut flash_spi, &mut flash_cs, 0x20, 0x1000);  // Erase sector 1
-    let n = wait_for_flash(&mut flash_spi, &mut flash_cs);
-
-    write_message(&mut uart, b"postpost addr 0:");
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 0, &mut outbuff);
-    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
-
-    write_message(&mut uart, b"postpost addr 1:");
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 1, &mut outbuff);
-    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
-
-    write_message(&mut uart, b"postpost addr 256:");
-    flash_read(&mut flash_spi, &mut flash_cs, 0x03, 256, &mut outbuff);
-    for i in 0..outbuff.len() { write_message(&mut uart, outbuff[i].numtoa(10, &mut numtoascratch)); }
-
 
     loop {
         neopixel_hue(&mut neopixel, &[85_u8; 10], 255, 2).expect("failed to start neopixels");
