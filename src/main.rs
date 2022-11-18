@@ -109,6 +109,27 @@ fn main() -> ! {
 
         //let mut numtoascratch = [0u8; 20];
         //val.numtoa(16, &mut numtoascratch);
+
+        /*  
+        interface plan:
+        * neopixels yellow for record mode if slide is 0, green if slide is 1
+        * if in record mode, left button triggers chip erase -> red neopixels until done.
+        * if in record mode, right button triggers record -> blue neopixels
+        * if in green mode, either button triggers data dump over uart -> magenta neopixels
+
+        plan on ~ 20ksamp / sec, 16-bit samples x 2 -> 32-bit samples, 80 kB/sec, well within the 365 kB/s limit 
+        set up ADC as 12 bit resolution, single-ended, 1/2 VDDANA, gain=2, free-running, which yields 8 clocks per conversion
+        350 ks / sec limit for 20 kHz x 2 channels -> up to 8 conversions per sample.  Try boosting to 13 bits via AVGCTRL.SAMPLENUM = 0x2, AVGCTRL.ADJRES = 0x1
+        20 *2 * 4 -> 160 kConversions -> 1.28 MHz before division.  Closesest matches are 96M / (4*19) or 48/9/4 (both DIV4 with another gclk)
+        *OR* can do 96 MHz / 15 / DIV4 / 10 clocks per conversion (requires a sampletime of 2.5 clock cycles?) -> 160 kconvs -> 20 khz per channel
+        A1->PA05->AIN5
+        A2->PA06->AIN6
+        A3->PA07->AIN7
+
+        in interrupt, catch result and drop it in a buffer that is 256 bytes long. switch to other buffer when full
+        in main loop, notice when a buffer is full and write it to flash as a full page
+        stop if record button is released
+        */
     
 
     loop {
