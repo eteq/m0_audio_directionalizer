@@ -53,7 +53,7 @@ fn main() -> ! {
     // Setup UART peripheral.
     let mut uart = bsp::uart(
         &mut clocks,
-        115200.hz(),
+        460800.hz(),
         peripherals.SERCOM4,
         &mut peripherals.PM,
         pins.a6,
@@ -67,7 +67,7 @@ fn main() -> ! {
             for byte in msg {
                 block!(uart.write(*byte)).ok();
             }
-            write_message(&mut uart, b"\rreset to stop showing this");
+            write_message_line(&mut uart, b"\rreset to stop showing this");
             delay.delay_ms(1000u16);
         }
     }
@@ -107,13 +107,13 @@ fn main() -> ! {
             panic!("Failed to read ID info from flash chip!");
         }
 
-        //let mut numtoascratch = [0u8; 20];
+        let mut numtoascratch = [0u8; 20];
         //val.numtoa(16, &mut numtoascratch);
 
         /*  
         interface plan:
         * neopixels yellow for record mode if slide is 0, green if slide is 1
-        * if in record mode, left button triggers chip erase -> red neopixels until done.
+        * if in record mode, left button triggers chip erase -> orange neopixels until done.
         * if in record mode, right button triggers record -> blue neopixels
         * if in green mode, either button triggers data dump over uart -> magenta neopixels
 
@@ -130,13 +130,82 @@ fn main() -> ! {
         in main loop, notice when a buffer is full and write it to flash as a full page
         stop if record button is released
         */
+
+    //TODO: set up ADC here
     
 
     loop {
-        neopixel_hue(&mut neopixel, &[85_u8; 10], 255, 2).expect("failed to start neopixels");
-        delay.delay_ms(500u16);
-        neopixel_hue(&mut neopixel, &[190_u8; 10], 255, 2).expect("failed to start neopixels");
-        delay.delay_ms(500u16);
+        if slide_switch.is_low().unwrap() {
+            //record mode
+            neopixel_hue(&mut neopixel, &[35_u8; 10], 255, 2).unwrap();
+            if left_button.is_high().unwrap() {
+                // chip erase
+                neopixel_hue(&mut neopixel, &[21_u8; 10], 255, 2).unwrap();
+
+                write_message_line(&mut uart, b"starting flash erase");
+                flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1); // write enable
+                flash_command(&mut flash_spi, &mut flash_cs, 0x60, -1); //chip erase
+                wait_for_flash(&mut flash_spi, &mut flash_cs);
+                write_message_line(&mut uart, b"flash erased!");
+            }
+            if right_button.is_high().unwrap() {
+                //record!
+
+                if !is_page_erased(&mut flash_spi, &mut flash_cs, 0) {
+                    neopixel_hue(&mut neopixel, &[0_u8; 10], 255, 2).unwrap();
+                    write_message_line(&mut uart, b"cannot record - flash not empty!");
+                    while right_button.is_high().unwrap() { }
+                } else {
+                    neopixel_hue(&mut neopixel, &[170_u8; 10], 255, 2).unwrap();
+                    write_message_line(&mut uart, b"starting recording");
+                    // TODO: start ADC
+                    neopixel_hue(&mut neopixel, &[170_u8; 10], 255, 2).unwrap();
+
+                    while right_button.is_high().unwrap() { 
+                        // whatever saving happens here
+                    }
+                    // TODO: stop ADC
+
+                    write_message_line(&mut uart, b"recording completed");
+                }
+                delay.delay_ms(100u16); // for debouncing
+            }
+        } else {
+            // writeback mode
+            neopixel_hue(&mut neopixel, &[82_u8; 10], 255, 2).unwrap();
+            if left_button.is_high().unwrap() || right_button.is_high().unwrap() {
+                // dump flash to uart - magenta
+                neopixel_hue(&mut neopixel, &[215_u8; 10], 255, 2).unwrap();
+
+                let nbytes = 2*1024*1024;
+
+                write_message(&mut uart, b"Reading back ");
+                write_message(&mut uart, nbytes.numtoa(16, &mut numtoascratch));
+                write_message_line(&mut uart, b" bytes");
+
+                flash_cs.set_low().expect("failed to set flash cs pin high");
+            
+                block!(flash_spi.send(0x03)).expect("flash send failed");
+                block!(flash_spi.read()).expect("flash read failed");
+                // address 0
+                for _ in (0..3).rev() {
+                    block!(flash_spi.send(0)).expect("flash send failed");
+                    block!(flash_spi.read()).expect("flash read failed");
+                }
+                
+                
+                for _ in 0..nbytes {
+                    let byte_to_transfer: u8;
+
+                    block!(flash_spi.send(1)).expect("flash send failed");
+                    byte_to_transfer = block!(flash_spi.read()).expect("flash read failed");
+                    block!(uart.write(byte_to_transfer)).expect("uart write failed");
+                }
+            
+                flash_cs.set_high().expect("failed to set flash cs pin high");
+            }
+        }
+        delay.delay_ms(5u16);
     }
 }
 
@@ -157,14 +226,18 @@ fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; 10], sat: u8,
 }
 
 
-fn write_message(uart: &mut bsp::Uart, msg: &[u8]) {
 
+fn write_message(uart: &mut bsp::Uart, msg: &[u8]) {
     for byte in msg {
         block!(uart.write(*byte)).expect("uart writing failed");
     }
+}
 
-    block!(uart.write('\r' as u8)).expect("uart writing failed");
-    block!(uart.write('\n' as u8)).expect("uart writing failed");
+fn write_message_line(uart: &mut bsp::Uart, msg: &[u8]) {
+
+    write_message(uart, msg);
+    write_message(uart, b"\r\n");
+
 }
 
 
@@ -238,6 +311,7 @@ fn flash_command(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, com
 }
 
 
+#[allow(dead_code)]
 fn is_flash_busy(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs) -> bool{
     let mut buf = [0; 1];
     flash_read(flash_spi, flash_cs, 0x05, -1, &mut buf);
@@ -288,4 +362,14 @@ fn flash_write_page(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, 
 
     }
     flash_cs.set_high().expect("failed to set flash cs pin high");
+}
+
+
+fn is_page_erased(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, address: i32) -> bool {
+    let mut outbuffer = [0u8; 256];
+    flash_read(flash_spi, flash_cs, 0x03, address, &mut outbuffer);
+    for i in 0..outbuffer.len() {
+        if outbuffer[i] != 0xff { return false }
+    }
+    true
 }
