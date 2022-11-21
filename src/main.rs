@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::ptr;
 use panic_persist;
 
 use bsp::hal;
@@ -8,7 +9,6 @@ use bsp::pac;
 use circuit_playground_express as bsp;
 
 use bsp::entry;
-//use hal::adc::Adc;
 use hal::clock::GenericClockController;
 use hal::delay::Delay;
 use hal::prelude::*;
@@ -16,7 +16,9 @@ use hal::timer::TimerCounter;
 use hal::sercom::v2::spi;
 use hal::time::MegaHertz;
 
-use pac::{CorePeripherals, Peripherals};
+use hal::gpio::v2 as gpio;
+
+use pac::{CorePeripherals, Peripherals,gclk};
 
 use smart_leds::{
     RGB,
@@ -45,9 +47,6 @@ fn main() -> ! {
     let mut delay = Delay::new(core.SYST, &mut clocks);
 
     let gclk0 = clocks.gclk0();
-    let timer_clock = clocks.tcc2_tc3(&gclk0).unwrap();
-    let mut timer = TimerCounter::tc3_(&timer_clock, peripherals.TC3, &mut peripherals.PM);
-    timer.start(3.mhz());
 
 
     // Setup UART peripheral.
@@ -82,13 +81,15 @@ fn main() -> ! {
     let right_button = pins.d5.into_pull_down_input(); // 1 is pressed
     let slide_switch = pins.d7.into_pull_up_input(); //1 is pointing to left
 
-    let neopixel_pin: bsp::NeoPixel = pins.d8.into();
-    let mut neopixel = ws2812::Ws2812::new(timer, neopixel_pin);
 
-    
-    // let mut adc = Adc::adc(peripherals.ADC, &mut peripherals.PM, &mut clocks);
-    // let mut a1 : hal::gpio::v2::Pin<hal::gpio::v2::pin::PA05, hal::gpio::v2::Alternate<hal::gpio::v2::B>> = pins.a1.into();
-    // let mut a2 : hal::gpio::v2::Pin<hal::gpio::v2::pin::PA06, hal::gpio::v2::Alternate<hal::gpio::v2::B>> = pins.a2.into();
+    let npx_timer_clock = clocks.tcc2_tc3(&gclk0).unwrap();
+    let mut npx_timer = TimerCounter::tc3_(&npx_timer_clock, peripherals.TC3, &mut peripherals.PM);
+    npx_timer.start(3.mhz());
+
+    let neopixel_pin: bsp::NeoPixel = pins.d8.into();
+
+    let mut neopixel = ws2812::Ws2812::new(npx_timer, neopixel_pin);
+
     neopixel_hue(&mut neopixel, &[30_u8; 10], 255, 2).expect("failed to start neopixels");
 
     //set up SPI for flash - defaults to 48 MHz and mode=0, which is fine for the flash chip
@@ -108,12 +109,11 @@ fn main() -> ! {
         }
 
         let mut numtoascratch = [0u8; 20];
-        //val.numtoa(16, &mut numtoascratch);
 
         /*  
         interface plan:
         * neopixels yellow for record mode if slide is 0, green if slide is 1
-        * if in record mode, left button triggers chip erase -> orange neopixels until done.
+        * if in record mode, left button triggers chip erase -> white neopixels until done.
         * if in record mode, right button triggers record -> blue neopixels
         * if in green mode, either button triggers data dump over uart -> magenta neopixels
 
@@ -131,7 +131,10 @@ fn main() -> ! {
         stop if record button is released
         */
 
-    //TODO: set up ADC here
+    // set up ADC with a1/a2 pins - note a1 and a2 are not directly used after this, and init_adc is currently hard-coded to use them
+    let mut _a1 : gpio::Pin<gpio::pin::PA05, gpio::Alternate<gpio::B>> = pins.a1.into();
+    let mut _a2 : gpio::Pin<gpio::pin::PA06, gpio::Alternate<gpio::B>> = pins.a2.into();
+    let adc = init_adc(peripherals.ADC, &mut peripherals.PM, &mut clocks);    
     
 
     loop {
@@ -140,7 +143,7 @@ fn main() -> ! {
             neopixel_hue(&mut neopixel, &[35_u8; 10], 255, 2).unwrap();
             if left_button.is_high().unwrap() {
                 // chip erase
-                neopixel_hue(&mut neopixel, &[21_u8; 10], 255, 2).unwrap();
+                neopixel_hue(&mut neopixel, &[0_u8; 10], 0, 2).unwrap();
 
                 write_message_line(&mut uart, b"starting flash erase");
                 flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1); // write enable
@@ -161,8 +164,15 @@ fn main() -> ! {
                     // TODO: start ADC
                     neopixel_hue(&mut neopixel, &[170_u8; 10], 255, 2).unwrap();
 
-                    while right_button.is_high().unwrap() { 
+                    while right_button.is_high().unwrap() || true { 
                         // whatever saving happens here
+
+                        while adc.status.read().syncbusy().bit_is_set() {}
+                        let res = adc.result.read().bits();
+                        write_message_line(&mut uart, b"adc result:");
+                        write_message_line(&mut uart, res.numtoa(10, &mut numtoascratch));
+                        delay.delay_ms(500u16);
+
                     }
                     // TODO: stop ADC
 
@@ -372,4 +382,81 @@ fn is_page_erased(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, ad
         if outbuffer[i] != 0xff { return false }
     }
     true
+}
+
+
+fn init_adc(adc: bsp::pac::ADC, 
+            pm: &mut bsp::pac::PM, 
+            clocks: &mut GenericClockController) -> bsp::pac::ADC {
+    pm.apbcmask.modify(|_, w| w.adc_().set_bit());
+
+    //set up 96 MHz clock / 15
+    let gclk2 = clocks.configure_gclk_divider_and_source(gclk::clkctrl::GEN_A::GCLK2, 
+        15, 
+        gclk::genctrl::SRC_A::DPLL96M, 
+        true).unwrap();
+
+    clocks.adc(&gclk2).expect("adc clock setup failed");
+    while adc.status.read().syncbusy().bit_is_set() {}
+
+    // reset should not be necessary but just in case
+    adc.ctrla.modify(|_, w| w.swrst().set_bit());
+    while adc.status.read().syncbusy().bit_is_set() {}
+
+    adc.ctrlb.modify(|_, w| {
+        w.prescaler().div4();
+        w.ressel()._16bit();
+        w.freerun().set_bit()
+    });
+    while adc.status.read().syncbusy().bit_is_set() {}
+
+    adc.sampctrl.modify(|_, w| unsafe { w.samplen().bits(4) }); //sample length
+    while adc.status.read().syncbusy().bit_is_set() {}
+
+    adc.avgctrl.modify(|_, w| {
+        w.samplenum()._4();
+        unsafe { w.adjres().bits(1) }
+    });
+
+    adc.refctrl.modify(|_, w| w.refsel().intvcc1() ); // 1/2 VDDANA
+    while adc.status.read().syncbusy().bit_is_set() {}
+
+    // load calibration data from NVM cal area
+    let regval1: u32;
+    let regval2: u32;
+    unsafe {
+        let addr1: *const u32 = (0x806020u32) as *const _;  
+        let addr2: *const u32 = (0x806024u32) as *const _;  
+        regval1 = ptr::read(addr1);
+        regval2 = ptr::read(addr2);
+    }
+    let linearity_cal = (((regval2 & 0x7) << 5) | ((regval1 & 0xf8000000) >> 27)) as u8;
+    let bias_cal = ((regval2 & 0b111000) >> 3) as u8;
+
+    adc.calib.modify(|_, w|  {
+        unsafe {
+            w.linearity_cal().bits(linearity_cal);
+            w.bias_cal().bits(bias_cal)
+        }
+    });
+    while adc.status.read().syncbusy().bit_is_set() {}
+
+
+    adc.inputctrl.modify(|_, w|  {
+        w.muxneg().gnd(); // No negative input (internal gnd)
+        w.gain().div2(); // offsets 1/2 VDDANA
+        w.muxpos().pin5(); // pin5 is A1
+        unsafe { w.inputscan().bits(1) }  // 1 cycles through pin 5/6 / A1/A2, 0 is just A1
+    });
+    while adc.status.read().syncbusy().bit_is_set() {}
+
+    // power up
+    adc.ctrla.modify(|_, w| w.enable().set_bit());
+    while adc.status.read().syncbusy().bit_is_set() {}
+
+    // trigger now to start freerunning going continuously
+    adc.swtrig.modify(|_, w| w.start().set_bit());
+    while adc.status.read().syncbusy().bit_is_set() {}
+
+    adc
 }
