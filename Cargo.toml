@@ -12,6 +12,7 @@ panic-persist = "0.3.0"
 smart-leds = "0.3.0"
 libm = "0.2.6"
 numtoa = "0.2.4"
+cortex-m = "0.7.6"
 
 
 

@@ -4,6 +4,9 @@
 use core::ptr;
 use panic_persist;
 
+use cortex_m::peripheral::NVIC;
+use cortex_m::interrupt::free as disable_interrupts;
+
 use bsp::hal;
 use bsp::pac;
 use circuit_playground_express as bsp;
@@ -18,7 +21,7 @@ use hal::time::MegaHertz;
 
 use hal::gpio::v2 as gpio;
 
-use pac::{CorePeripherals, Peripherals,gclk};
+use pac::{CorePeripherals, Peripherals,gclk, interrupt};
 
 use smart_leds::{
     RGB,
@@ -30,12 +33,12 @@ use ws2812_timer_delay as ws2812;
 use nb::block;
 use numtoa::NumToA;
 
-// adjusts hue in response to the two analog inputs
+const NPIX : usize = 10;
 
 #[entry]
 fn main() -> ! {
     let mut peripherals = Peripherals::take().unwrap();
-    let core = CorePeripherals::take().unwrap();
+    let mut corep = CorePeripherals::take().unwrap();
     let mut clocks = GenericClockController::with_internal_32kosc(
         peripherals.GCLK,
         &mut peripherals.PM,
@@ -44,7 +47,7 @@ fn main() -> ! {
     );
     
     let pins = bsp::Pins::new(peripherals.PORT);
-    let mut delay = Delay::new(core.SYST, &mut clocks);
+    let mut delay = Delay::new(corep.SYST, &mut clocks);
 
     let gclk0 = clocks.gclk0();
 
@@ -90,7 +93,7 @@ fn main() -> ! {
 
     let mut neopixel = ws2812::Ws2812::new(npx_timer, neopixel_pin);
 
-    neopixel_hue(&mut neopixel, &[30_u8; 10], 255, 2).expect("failed to start neopixels");
+    neopixel_hue(&mut neopixel, &[30_u8; NPIX], 255, 2).expect("failed to start neopixels");
 
     //set up SPI for flash - defaults to 48 MHz and mode=0, which is fine for the flash chip
     let (mut flash_spi, mut flash_cs) = flash_spi_master2(
@@ -134,16 +137,18 @@ fn main() -> ! {
     // set up ADC with a1/a2 pins - note a1 and a2 are not directly used after this, and init_adc is currently hard-coded to use them
     let mut _a1 : gpio::Pin<gpio::pin::PA05, gpio::Alternate<gpio::B>> = pins.a1.into();
     let mut _a2 : gpio::Pin<gpio::pin::PA06, gpio::Alternate<gpio::B>> = pins.a2.into();
+
+    unsafe { corep.NVIC.set_priority(interrupt::ADC, 1); }
     let adc = init_adc(peripherals.ADC, &mut peripherals.PM, &mut clocks);    
     
 
     loop {
         if slide_switch.is_low().unwrap() {
             //record mode
-            neopixel_hue(&mut neopixel, &[35_u8; 10], 255, 2).unwrap();
+            neopixel_hue(&mut neopixel, &[35_u8; NPIX], 255, 2).unwrap();
             if left_button.is_high().unwrap() {
                 // chip erase
-                neopixel_hue(&mut neopixel, &[0_u8; 10], 0, 2).unwrap();
+                neopixel_hue(&mut neopixel, &[0_u8; NPIX], 0, 2).unwrap();
 
                 write_message_line(&mut uart, b"starting flash erase");
                 flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1); // write enable
@@ -155,37 +160,66 @@ fn main() -> ! {
                 //record!
 
                 if !is_page_erased(&mut flash_spi, &mut flash_cs, 0) {
-                    neopixel_hue(&mut neopixel, &[0_u8; 10], 255, 2).unwrap();
+                    neopixel_hue(&mut neopixel, &[0_u8; NPIX], 255, 2).unwrap();
                     write_message_line(&mut uart, b"cannot record - flash not empty!");
                     while right_button.is_high().unwrap() { }
                 } else {
-                    neopixel_hue(&mut neopixel, &[170_u8; 10], 255, 2).unwrap();
+                    neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 2).unwrap();
                     write_message_line(&mut uart, b"starting recording");
-                    // TODO: start ADC
-                    neopixel_hue(&mut neopixel, &[170_u8; 10], 255, 2).unwrap();
+                    
+
+                    // Clear the interrupt flag just before unmasking
+                    adc.intflag.modify(|_, w| w.resrdy().set_bit());
+                    unsafe{ NVIC::unmask(interrupt::ADC); }
+
+                    neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 2).unwrap();
 
                     while right_button.is_high().unwrap() || true { 
-                        // whatever saving happens here
+                        let whichdata: usize;
+                        unsafe {
+                            if DATA1_IDX >= DATA_SIZE {
+                                whichdata = 1;
+                            } else if DATA2_IDX >= DATA_SIZE {
+                                whichdata = 2;
+                            } else {
+                                whichdata = 0;
+                            }
+                        }
+                        let no: isize;
+                        match whichdata {
+                            1 => { unsafe { DATA1_IDX = 0 ; no = N_OVERRUN as isize;} },
+                            2 => { unsafe { DATA2_IDX = 0 ; no = N_OVERRUN as isize ;} },
+                            0 => { no = 0; },  // don't do anything
+                            _ => { no = -1; },
+                        }
+                        if no >= 0 {
+                            write_message_line(&mut uart, b"got data, noverflows:");
+                            write_message_line(&mut uart, no.numtoa(10, &mut numtoascratch));
+                            write_message_line(&mut uart, b"got data, indexes:");
+                            unsafe{ 
+                            write_message_line(&mut uart, DATA1_IDX.numtoa(10, &mut numtoascratch));
+                            write_message_line(&mut uart, DATA2_IDX.numtoa(10, &mut numtoascratch));}
+                        }
+                        // TODO: whatever saving happens here
 
-                        while adc.status.read().syncbusy().bit_is_set() {}
-                        let res = adc.result.read().bits();
-                        write_message_line(&mut uart, b"adc result:");
-                        write_message_line(&mut uart, res.numtoa(10, &mut numtoascratch));
-                        delay.delay_ms(500u16);
-
+                        delay.delay_ms(200u16);
                     }
-                    // TODO: stop ADC
+                    
+                    // mask to stop responding to the free-running ADC
+                    NVIC::mask(interrupt::ADC);
 
+                    // turn off the neopixels for fast "it's done" response
+                    neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 0).unwrap();
                     write_message_line(&mut uart, b"recording completed");
                 }
                 delay.delay_ms(100u16); // for debouncing
             }
         } else {
             // writeback mode
-            neopixel_hue(&mut neopixel, &[82_u8; 10], 255, 2).unwrap();
+            neopixel_hue(&mut neopixel, &[82_u8; NPIX], 255, 2).unwrap();
             if left_button.is_high().unwrap() || right_button.is_high().unwrap() {
                 // dump flash to uart - magenta
-                neopixel_hue(&mut neopixel, &[215_u8; 10], 255, 2).unwrap();
+                neopixel_hue(&mut neopixel, &[215_u8; NPIX], 255, 2).unwrap();
 
                 let nbytes = 2*1024*1024;
 
@@ -220,7 +254,63 @@ fn main() -> ! {
 }
 
 
-fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; 10], sat: u8, val: u8) -> Result<(), S::Error>
+// ugh globals not concurrency safe, RTIC if need anything fancier
+const DATA_SIZE: usize = 128;
+static mut N_OVERRUN:usize = 0;
+static mut DATA1: [u16; DATA_SIZE] = [0u16; DATA_SIZE];
+static mut DATA1_IDX: usize = 0;
+static mut DATA2: [u16; DATA_SIZE] = [0u16; DATA_SIZE];
+static mut DATA2_IDX: usize = 0;
+
+#[interrupt]
+fn ADC() {
+    let adcreg;
+    unsafe{ adcreg = bsp::pac::ADC::ptr().as_ref().unwrap(); }
+
+    if adcreg.intflag.read().resrdy().bit_is_set() {
+        // conversion completed
+        disable_interrupts(|_| {
+            unsafe {
+                let i: &mut usize;
+                let dataarr: &mut [u16; DATA_SIZE];
+
+                // use data2 if it has been started but not full, or data1 is full, or 
+                if DATA1_IDX >= DATA_SIZE {
+                    if DATA2_IDX >= DATA_SIZE {
+                        panic!("both buffers are full, ahh!!");
+                    } else {
+                        i = &mut DATA2_IDX;
+                        dataarr = &mut DATA2;
+                    }
+                } else if DATA2_IDX > 0 {
+                    i = &mut DATA2_IDX;
+                    dataarr = &mut DATA2;
+                } else {
+                    i = &mut DATA1_IDX;
+                    dataarr = &mut DATA1;
+                }
+
+                dataarr[*i] = adcreg.result.read().bits();
+                *i += 1;
+            }
+        });
+
+        // clear the data ready interrupt
+        adcreg.intflag.write(|w| w.resrdy().set_bit());
+    }
+
+    // note overrun does *not* trigger the interrupt as of this comment - this is bookkeeping for when the data are recorded
+    if adcreg.intflag.read().overrun().bit_is_set() {
+        // an overrun occurred since the last conversion, record it and clear
+
+        disable_interrupts(|_| unsafe {N_OVERRUN += 1;});
+        // clear the interrupt
+        adcreg.intflag.write(|w| w.overrun().set_bit());
+    }
+}
+
+
+fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; NPIX], sat: u8, val: u8) -> Result<(), S::Error>
     where <S as SmartLedsWrite>::Color: From<RGB<u8>> {
 
     let rgbarr: [RGB<u8>; 10] = core::array::from_fn( |i| {
@@ -277,7 +367,7 @@ fn flash_spi_master2(
 }
 
 
-fn flash_read(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, command: u8, address: i32, outbuffer: &mut[u8]) {
+fn flash_read(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, command: u8, address: isize, outbuffer: &mut[u8]) {
     // negative address means no address, as addresses are only 24 bit
     // addresses are byte-addresses
 
@@ -302,7 +392,7 @@ fn flash_read(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, comman
 }
 
 
-fn flash_command(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, command: u8, address: i32) {
+fn flash_command(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, command: u8, address: isize) {
     // negative address means no address, as addresses are only 24 bit
 
     flash_cs.set_low().expect("failed to set flash cs pin high");
@@ -336,7 +426,7 @@ fn wait_for_flash(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs) ->
     block!(flash_spi.send(0x05)).expect("flash send failed");
     block!(flash_spi.read()).expect("flash read failed");
 
-    let mut i = -1i32;
+    let mut i = -1isize;
     let mut status = 1u8;
     while (status & 1) == 1 {
         block!(flash_spi.send(0x05)).expect("flash send failed");
@@ -350,7 +440,7 @@ fn wait_for_flash(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs) ->
 }
 
 
-fn flash_write_page(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, address: i32, towrite: &[u8]) {
+fn flash_write_page(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, address: isize, towrite: &[u8]) {
     // addresses are byte-addresses
     if address < 0 { panic!("must give a non-negative address for writing!"); }
     if towrite.len() < 1 || towrite.len() > 256 { panic!("page must be 0 to 256 bytes!");}
@@ -375,7 +465,7 @@ fn flash_write_page(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, 
 }
 
 
-fn is_page_erased(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, address: i32) -> bool {
+fn is_page_erased(flash_spi: &mut bsp::FlashSpi, flash_cs: &mut bsp::FlashCs, address: isize) -> bool {
     let mut outbuffer = [0u8; 256];
     flash_read(flash_spi, flash_cs, 0x03, address, &mut outbuffer);
     for i in 0..outbuffer.len() {
@@ -397,21 +487,21 @@ fn init_adc(adc: bsp::pac::ADC,
         true).unwrap();
 
     clocks.adc(&gclk2).expect("adc clock setup failed");
-    while adc.status.read().syncbusy().bit_is_set() {}
+    wait_for_adc_sync(&adc);
 
     // reset should not be necessary but just in case
     adc.ctrla.modify(|_, w| w.swrst().set_bit());
-    while adc.status.read().syncbusy().bit_is_set() {}
+    wait_for_adc_sync(&adc);
 
     adc.ctrlb.modify(|_, w| {
         w.prescaler().div4();
         w.ressel()._16bit();
         w.freerun().set_bit()
     });
-    while adc.status.read().syncbusy().bit_is_set() {}
+    wait_for_adc_sync(&adc);
 
     adc.sampctrl.modify(|_, w| unsafe { w.samplen().bits(4) }); //sample length
-    while adc.status.read().syncbusy().bit_is_set() {}
+    wait_for_adc_sync(&adc);
 
     adc.avgctrl.modify(|_, w| {
         w.samplenum()._4();
@@ -419,7 +509,7 @@ fn init_adc(adc: bsp::pac::ADC,
     });
 
     adc.refctrl.modify(|_, w| w.refsel().intvcc1() ); // 1/2 VDDANA
-    while adc.status.read().syncbusy().bit_is_set() {}
+    wait_for_adc_sync(&adc);
 
     // load calibration data from NVM cal area
     let regval1: u32;
@@ -439,7 +529,7 @@ fn init_adc(adc: bsp::pac::ADC,
             w.bias_cal().bits(bias_cal)
         }
     });
-    while adc.status.read().syncbusy().bit_is_set() {}
+    wait_for_adc_sync(&adc);
 
 
     adc.inputctrl.modify(|_, w|  {
@@ -448,15 +538,27 @@ fn init_adc(adc: bsp::pac::ADC,
         w.muxpos().pin5(); // pin5 is A1
         unsafe { w.inputscan().bits(1) }  // 1 cycles through pin 5/6 / A1/A2, 0 is just A1
     });
-    while adc.status.read().syncbusy().bit_is_set() {}
+    wait_for_adc_sync(&adc);
+
+    // Make sure the interrupt is *not* globally set since we want the "turn on" to come from unmasking the interrupt
+    NVIC::mask(interrupt::ADC);
+
+    // set the "ready" interrupt
+    adc.intenset.write(|w| w.resrdy().set_bit());
+    wait_for_adc_sync(&adc);
 
     // power up
     adc.ctrla.modify(|_, w| w.enable().set_bit());
-    while adc.status.read().syncbusy().bit_is_set() {}
+    wait_for_adc_sync(&adc);
 
     // trigger now to start freerunning going continuously
     adc.swtrig.modify(|_, w| w.start().set_bit());
-    while adc.status.read().syncbusy().bit_is_set() {}
+    wait_for_adc_sync(&adc);
 
     adc
+}
+
+#[inline]
+fn wait_for_adc_sync(adc: &bsp::pac::ADC) {
+    while adc.status.read().syncbusy().bit_is_set() {};
 }
