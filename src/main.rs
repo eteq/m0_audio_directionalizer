@@ -229,7 +229,7 @@ fn main() -> ! {
                             write_buffer[254] = ((tcount >> 8) & 0xff) as u8;
                             write_buffer[255] = (tcount & 0xff) as u8;
 
-                            flash_write_page(&mut flash_spi, &mut flash_cs, (pages_written + 1) as isize, &write_buffer);
+                            flash_write_page(&mut flash_spi, &mut flash_cs, ((pages_written + 1) as isize)*256, &write_buffer);
                             pages_written += 1;
 
                         }
@@ -265,14 +265,8 @@ fn main() -> ! {
                 // dump flash to uart - magenta
                 neopixel_hue(&mut neopixel, &[215_u8; NPIX], 255, 2).unwrap();
 
-                let nbytes = 2*1024*1024;
-
-                write_message(&mut uart, b"Reading back ");
-                write_message(&mut uart, nbytes.numtoa(16, &mut numtoascratch));
-                write_message_line(&mut uart, b" bytes");
-
-                flash_cs.set_low().expect("failed to set flash cs pin high");
-            
+                // read first two bytes to work out how many bytes to read
+                flash_cs.set_low().expect("failed to set flash cs pin low");
                 block!(flash_spi.send(0x03)).expect("flash send failed");
                 block!(flash_spi.read()).expect("flash read failed");
                 // address 0
@@ -280,6 +274,31 @@ fn main() -> ! {
                     block!(flash_spi.send(0)).expect("flash send failed");
                     block!(flash_spi.read()).expect("flash read failed");
                 }
+                block!(flash_spi.send(0x03)).expect("flash send failed");
+                let nbytes1 = block!(flash_spi.read()).unwrap();
+                block!(flash_spi.send(0x03)).expect("flash send failed");
+                let nbytes2 = block!(flash_spi.read()).unwrap();
+                flash_cs.set_high().expect("failed to set flash cs pin high");
+
+                //let nbytes = 2*1024*1024;
+                let npages: isize = (nbytes2 as isize) + ((nbytes1 as isize) << 8);
+                let nbytes = npages*256;
+
+                write_message(&mut uart, b"Reading back ");
+                write_message(&mut uart, nbytes.numtoa(10, &mut numtoascratch));
+                write_message_line(&mut uart, b" bytes");
+
+                flash_cs.set_low().expect("failed to set flash cs pin low");
+            
+                block!(flash_spi.send(0x03)).expect("flash send failed");
+                block!(flash_spi.read()).expect("flash read failed");
+                // address 256, skipping the first page
+                block!(flash_spi.send(0)).expect("flash send failed");
+                block!(flash_spi.read()).expect("flash read failed");
+                block!(flash_spi.send(1)).expect("flash send failed");
+                block!(flash_spi.read()).expect("flash read failed");
+                block!(flash_spi.send(0)).expect("flash send failed");
+                block!(flash_spi.read()).expect("flash read failed");
                 
                 
                 for _ in 0..nbytes {
