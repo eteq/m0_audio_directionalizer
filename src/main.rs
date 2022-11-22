@@ -135,7 +135,12 @@ fn main() -> ! {
 
         plan on ~ 20ksamp / sec, 16-bit samples x 2 -> 32-bit samples, 80 kB/sec, well within the 365 kB/s limit 
         https://blog.thea.codes/getting-the-most-out-of-the-samd21-adc/ gives timing calcs.  To get 22.05 kHz per channel:
-        48 MHz / 17 & DIV4 & 12-bit & DIV2 gain & SAMPLEN=0, &16 samples & no offset corren
+        48 MHz / 17 & DIV4 & 12-bit & DIV2 gain & SAMPLEN=0, &16 samples & no offset corren . But that gave ~8 k per sec so something's very wrong there
+        Alternatives:
+        48 MHz / DIV4 / gclockdiv=8 / 4 accumulations / 8.5 clocks per conversion = 22.058 kHz per channel (within noise of clock to 22.05 kHz)
+        48 MHz / DIV4 / gclockdiv=10 / 2 accumulations / 12.5 clocks per conversion = 24 kHz per channel
+        48 MHz / DIV4 / gclockdiv=6 / 4 accumulations / 10.5 clocks per conversion = 23.81 kHz per channel (within noise of clock to 24 kHz)
+        48 MHz / DIV4 / gclockdiv=7 / 4 accumulations / 9 clocks per conversion = 23.81 kHz per channel (within noise of clock to 24 kHz)
 
         A1->PA05->AIN5
         A2->PA06->AIN6
@@ -186,9 +191,11 @@ fn main() -> ! {
                         DATA2_IDX = 0;
                     }
 
+                    let start_time = rtc.count32();
                     // Clear the interrupt flag just before unmasking
                     adc.intflag.modify(|_, w| w.resrdy().set_bit());
                     unsafe{ NVIC::unmask(interrupt::ADC); }
+
 
                     neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 2).unwrap();
 
@@ -230,6 +237,7 @@ fn main() -> ! {
                             write_buffer[255] = (tcount & 0xff) as u8;
 
                             flash_write_page(&mut flash_spi, &mut flash_cs, ((pages_written + 1) as isize)*256, &write_buffer);
+
                             pages_written += 1;
 
                         }
@@ -239,14 +247,21 @@ fn main() -> ! {
                     
                     // mask to stop responding to the free-running ADC
                     NVIC::mask(interrupt::ADC);
+                    let stop_time = rtc.count32();
 
                     let no = unsafe { N_OVERRUN };
+
+                    let freqeff = ((pages_written*DATA_SIZE) as f32)*1e6_f32/((stop_time - start_time) as f32);
 
                     // turn off the neopixels for fast "it's done" response
                     neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 0).unwrap();
 
-                    let write_buffer = [((pages_written >> 8) & 0xff) as u8, 
-                                                 (pages_written & 0xff) as u8];
+                    // write info to the first page. first 2 bytes give a number of pages, next 2 bytes are best guess at sampling frequency
+                    let write_buffer: [u8; 4] = [((pages_written >> 8) & 0xff) as u8, 
+                                                 (pages_written & 0xff) as u8,
+                                                 (((freqeff as u16) >> 8) & 0xff) as u8, 
+                                                 ((freqeff as u16) & 0xff) as u8
+                                                ];
                     flash_write_page(&mut flash_spi, &mut flash_cs, 0, &write_buffer);
 
                     write_message_line(&mut uart, b"Recording completed.");
@@ -254,6 +269,9 @@ fn main() -> ! {
                     write_message_line(&mut uart, (pages_written/4).numtoa(10, &mut numtoascratch));
                     write_message(&mut uart, b"Number of overruns:");
                     write_message_line(&mut uart, no.numtoa(10, &mut numtoascratch));
+
+                    write_message(&mut uart, b"Sampling frequency:");
+                    write_message_line(&mut uart, (freqeff as u32).numtoa(10, &mut numtoascratch));
 
                 }
                 delay.delay_ms(100u16); // for debouncing
@@ -536,11 +554,12 @@ fn init_adc(adc: bsp::pac::ADC,
     pm.apbcmask.modify(|_, w| w.adc_().set_bit());
 
 
-    //48 MHz / 17 & DIV4 & 12-bit & DIV2 gain & SAMPLEN=0, &16 samples & no offset corren
+    //48 MHz / DIV4 / gclockdiv=8 / 4 accumulations / 8.5 clocks per conversion = 22.058 kHz per channel (within noise of clock to 22.05 kHz)
+    // 8.5 clocks per conversion = samplelen of 1
+    // this still doesn't match, so just go empirical to get the numbers below.  Seems to average 47.7 kHz -> 23.85 kHz per channel, within noise of 48/24
 
-    //set up 48 MHz clock / 17
     let gclk_for_adc = clocks.configure_gclk_divider_and_source(ClockGenId::GCLK3, 
-        17, 
+        7, 
         ClockSource::DFLL48M, 
         true).unwrap();
 
@@ -558,11 +577,11 @@ fn init_adc(adc: bsp::pac::ADC,
     });
     wait_for_adc_sync(&adc);
 
-    adc.sampctrl.modify(|_, w| unsafe { w.samplen().bits(0) }); //sample length
+    adc.sampctrl.modify(|_, w| unsafe { w.samplen().bits(4) }); //sample length
     wait_for_adc_sync(&adc);
 
     adc.avgctrl.modify(|_, w| {
-        w.samplenum()._16()
+        w.samplenum()._4()
     });
 
     adc.refctrl.modify(|_, w| w.refsel().intvcc1() ); // 1/2 VDDANA
