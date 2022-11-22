@@ -3,6 +3,9 @@ name = "m0_audio_directionalizer"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+log-time = []
+
 [dependencies]
 
 circuit_playground_express = { git = "https://github.com/atsamd-rs/atsamd", features = ["unproven"]}

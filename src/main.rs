@@ -36,6 +36,9 @@ use numtoa::NumToA;
 const NPIX : usize = 10;
 
 // ugh globals not concurrency safe, RTIC if need anything fancier
+#[cfg(not(feature = "log-time"))]
+const DATA_SIZE: usize = 128; 
+#[cfg(feature = "log-time")]
 const DATA_SIZE: usize = 126;  // a page is 256 bytes, so this should fit that - overhead of u32 rtc count at the start of the page
 static mut N_OVERRUN:usize = 0;
 static mut DATA1: [u16; DATA_SIZE] = [0u16; DATA_SIZE];
@@ -230,11 +233,14 @@ fn main() -> ! {
                                 write_buffer[j] = ((data_arr[i] >> 8) & 0xff) as u8;
                                 write_buffer[j + 1] = (data_arr[i] & 0xff) as u8;
                             }
-                            let tcount = rtc.count32();
-                            write_buffer[252] = ((tcount >> 24) & 0xff) as u8;
-                            write_buffer[253] = ((tcount >> 16) & 0xff) as u8;
-                            write_buffer[254] = ((tcount >> 8) & 0xff) as u8;
-                            write_buffer[255] = (tcount & 0xff) as u8;
+                            #[cfg(feature = "log-time")] 
+                            {
+                                let tcount = rtc.count32();
+                                write_buffer[252] = ((tcount >> 24) & 0xff) as u8;
+                                write_buffer[253] = ((tcount >> 16) & 0xff) as u8;
+                                write_buffer[254] = ((tcount >> 8) & 0xff) as u8;
+                                write_buffer[255] = (tcount & 0xff) as u8;
+                            }
 
                             flash_write_page(&mut flash_spi, &mut flash_cs, ((pages_written + 1) as isize)*256, &write_buffer);
 
@@ -302,9 +308,10 @@ fn main() -> ! {
                 let npages: isize = (nbytes2 as isize) + ((nbytes1 as isize) << 8);
                 let nbytes = npages*256;
 
-                write_message(&mut uart, b"Reading back ");
-                write_message(&mut uart, nbytes.numtoa(10, &mut numtoascratch));
-                write_message_line(&mut uart, b" bytes");
+                // these are useful for debugging, but get in the way of dumping to disk
+                //write_message(&mut uart, b"Reading back ");
+                //write_message(&mut uart, nbytes.numtoa(10, &mut numtoascratch));
+                //write_message_line(&mut uart, b" bytes");
 
                 flash_cs.set_low().expect("failed to set flash cs pin low");
             
