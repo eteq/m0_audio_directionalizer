@@ -12,7 +12,7 @@ use bsp::pac;
 use circuit_playground_express as bsp;
 
 use bsp::entry;
-use hal::clock::GenericClockController;
+use hal::clock::{GenericClockController, ClockGenId, ClockSource};
 use hal::delay::Delay;
 use hal::prelude::*;
 use hal::timer::TimerCounter;
@@ -21,7 +21,7 @@ use hal::time::MegaHertz;
 
 use hal::gpio::v2 as gpio;
 
-use pac::{CorePeripherals, Peripherals,gclk, interrupt};
+use pac::{CorePeripherals, Peripherals, interrupt};
 
 use smart_leds::{
     RGB,
@@ -34,6 +34,14 @@ use nb::block;
 use numtoa::NumToA;
 
 const NPIX : usize = 10;
+
+// ugh globals not concurrency safe, RTIC if need anything fancier
+const DATA_SIZE: usize = 126;  // a page is 256 bytes, so this should fit that - overhead of u32 rtc count at the start of the page
+static mut N_OVERRUN:usize = 0;
+static mut DATA1: [u16; DATA_SIZE] = [0u16; DATA_SIZE];
+static mut DATA1_IDX: usize = 0;
+static mut DATA2: [u16; DATA_SIZE] = [0u16; DATA_SIZE];
+static mut DATA2_IDX: usize = 0;
 
 #[entry]
 fn main() -> ! {
@@ -51,6 +59,11 @@ fn main() -> ! {
 
     let gclk0 = clocks.gclk0();
 
+    // start up RTC
+    let rtc_timer_clock = clocks.configure_gclk_divider_and_source(ClockGenId::GCLK2, 8, ClockSource::OSC8M, false).unwrap();
+    let rtc_clock = clocks.rtc(&rtc_timer_clock).unwrap();
+    let rtc = hal::rtc::Rtc::count32_mode(peripherals.RTC, rtc_clock.freq(), &mut peripherals.PM);
+    
 
     // Setup UART peripheral.
     let mut uart = bsp::uart(
@@ -121,10 +134,9 @@ fn main() -> ! {
         * if in green mode, either button triggers data dump over uart -> magenta neopixels
 
         plan on ~ 20ksamp / sec, 16-bit samples x 2 -> 32-bit samples, 80 kB/sec, well within the 365 kB/s limit 
-        set up ADC as 12 bit resolution, single-ended, 1/2 VDDANA, gain=2, free-running, which yields 8 clocks per conversion
-        350 ks / sec limit for 20 kHz x 2 channels -> up to 8 conversions per sample.  Try boosting to 13 bits via AVGCTRL.SAMPLENUM = 0x2, AVGCTRL.ADJRES = 0x1
-        20 *2 * 4 -> 160 kConversions -> 1.28 MHz before division.  Closesest matches are 96M / (4*19) or 48/9/4 (both DIV4 with another gclk)
-        *OR* can do 96 MHz / 15 / DIV4 / 10 clocks per conversion (requires a sampletime of 2.5 clock cycles?) -> 160 kconvs -> 20 khz per channel
+        https://blog.thea.codes/getting-the-most-out-of-the-samd21-adc/ gives timing calcs.  To get 22.05 kHz per channel:
+        48 MHz / 17 & DIV4 & 12-bit & DIV2 gain & SAMPLEN=0, &16 samples & no offset corren
+
         A1->PA05->AIN5
         A2->PA06->AIN6
         A3->PA07->AIN7
@@ -167,6 +179,12 @@ fn main() -> ! {
                     neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 2).unwrap();
                     write_message_line(&mut uart, b"starting recording");
                     
+                    // reset the global state before starting the interrupt
+                    unsafe { 
+                        N_OVERRUN = 0;
+                        DATA1_IDX = 0;
+                        DATA2_IDX = 0;
+                    }
 
                     // Clear the interrupt flag just before unmasking
                     adc.intflag.modify(|_, w| w.resrdy().set_bit());
@@ -174,43 +192,69 @@ fn main() -> ! {
 
                     neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 2).unwrap();
 
-                    while right_button.is_high().unwrap() || true { 
+                    let mut pages_written = 0usize;
+                    while right_button.is_high().unwrap() {
+
                         let whichdata: usize;
                         unsafe {
-                            if DATA1_IDX >= DATA_SIZE {
+                            if (DATA1_IDX >= DATA_SIZE) && (DATA2_IDX > 0){
                                 whichdata = 1;
-                            } else if DATA2_IDX >= DATA_SIZE {
+                            } else if (DATA2_IDX >= DATA_SIZE) && (DATA1_IDX > 0) {
                                 whichdata = 2;
                             } else {
                                 whichdata = 0;
                             }
                         }
-                        let no: isize;
-                        match whichdata {
-                            1 => { unsafe { DATA1_IDX = 0 ; no = N_OVERRUN as isize;} },
-                            2 => { unsafe { DATA2_IDX = 0 ; no = N_OVERRUN as isize ;} },
-                            0 => { no = 0; },  // don't do anything
-                            _ => { no = -1; },
-                        }
-                        if no >= 0 {
-                            write_message_line(&mut uart, b"got data, noverflows:");
-                            write_message_line(&mut uart, no.numtoa(10, &mut numtoascratch));
-                            write_message_line(&mut uart, b"got data, indexes:");
-                            unsafe{ 
-                            write_message_line(&mut uart, DATA1_IDX.numtoa(10, &mut numtoascratch));
-                            write_message_line(&mut uart, DATA2_IDX.numtoa(10, &mut numtoascratch));}
-                        }
-                        // TODO: whatever saving happens here
 
-                        delay.delay_ms(200u16);
+                        if (whichdata > 0) && (whichdata < 3) {
+                            let data_arr: &mut [u16; DATA_SIZE];
+                            unsafe {
+                                if whichdata == 1 {
+                                    data_arr = &mut DATA1;
+                                    disable_interrupts(|_| { DATA1_IDX = 0; });
+                                } else {
+                                    data_arr = &mut DATA2;
+                                    disable_interrupts(|_| { DATA2_IDX = 0; });
+                                }
+                            }
+                            let mut write_buffer = [0u8; 256];
+                            for i in 0..data_arr.len() {
+                                let j = i*2;
+                                write_buffer[j] = ((data_arr[i] >> 8) & 0xff) as u8;
+                                write_buffer[j + 1] = (data_arr[i] & 0xff) as u8;
+                            }
+                            let tcount = rtc.count32();
+                            write_buffer[252] = ((tcount >> 24) & 0xff) as u8;
+                            write_buffer[253] = ((tcount >> 16) & 0xff) as u8;
+                            write_buffer[254] = ((tcount >> 8) & 0xff) as u8;
+                            write_buffer[255] = (tcount & 0xff) as u8;
+
+                            flash_write_page(&mut flash_spi, &mut flash_cs, (pages_written + 1) as isize, &write_buffer);
+                            pages_written += 1;
+
+                        }
+
+                        delay.delay_ms(1u16);
                     }
                     
                     // mask to stop responding to the free-running ADC
                     NVIC::mask(interrupt::ADC);
 
+                    let no = unsafe { N_OVERRUN };
+
                     // turn off the neopixels for fast "it's done" response
                     neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 0).unwrap();
-                    write_message_line(&mut uart, b"recording completed");
+
+                    let write_buffer = [((pages_written >> 8) & 0xff) as u8, 
+                                                 (pages_written & 0xff) as u8];
+                    flash_write_page(&mut flash_spi, &mut flash_cs, 0, &write_buffer);
+
+                    write_message_line(&mut uart, b"Recording completed.");
+                    write_message(&mut uart, b"kB written:");
+                    write_message_line(&mut uart, (pages_written/4).numtoa(10, &mut numtoascratch));
+                    write_message(&mut uart, b"Number of overruns:");
+                    write_message_line(&mut uart, no.numtoa(10, &mut numtoascratch));
+
                 }
                 delay.delay_ms(100u16); // for debouncing
             }
@@ -254,14 +298,6 @@ fn main() -> ! {
 }
 
 
-// ugh globals not concurrency safe, RTIC if need anything fancier
-const DATA_SIZE: usize = 128;
-static mut N_OVERRUN:usize = 0;
-static mut DATA1: [u16; DATA_SIZE] = [0u16; DATA_SIZE];
-static mut DATA1_IDX: usize = 0;
-static mut DATA2: [u16; DATA_SIZE] = [0u16; DATA_SIZE];
-static mut DATA2_IDX: usize = 0;
-
 #[interrupt]
 fn ADC() {
     let adcreg;
@@ -282,7 +318,7 @@ fn ADC() {
                         i = &mut DATA2_IDX;
                         dataarr = &mut DATA2;
                     }
-                } else if DATA2_IDX > 0 {
+                } else if (DATA2_IDX > 0) && (DATA2_IDX < DATA_SIZE) {
                     i = &mut DATA2_IDX;
                     dataarr = &mut DATA2;
                 } else {
@@ -480,13 +516,16 @@ fn init_adc(adc: bsp::pac::ADC,
             clocks: &mut GenericClockController) -> bsp::pac::ADC {
     pm.apbcmask.modify(|_, w| w.adc_().set_bit());
 
-    //set up 96 MHz clock / 15
-    let gclk2 = clocks.configure_gclk_divider_and_source(gclk::clkctrl::GEN_A::GCLK2, 
-        15, 
-        gclk::genctrl::SRC_A::DPLL96M, 
+
+    //48 MHz / 17 & DIV4 & 12-bit & DIV2 gain & SAMPLEN=0, &16 samples & no offset corren
+
+    //set up 48 MHz clock / 17
+    let gclk_for_adc = clocks.configure_gclk_divider_and_source(ClockGenId::GCLK3, 
+        17, 
+        ClockSource::DFLL48M, 
         true).unwrap();
 
-    clocks.adc(&gclk2).expect("adc clock setup failed");
+    clocks.adc(&gclk_for_adc).expect("adc clock setup failed");
     wait_for_adc_sync(&adc);
 
     // reset should not be necessary but just in case
@@ -500,12 +539,11 @@ fn init_adc(adc: bsp::pac::ADC,
     });
     wait_for_adc_sync(&adc);
 
-    adc.sampctrl.modify(|_, w| unsafe { w.samplen().bits(4) }); //sample length
+    adc.sampctrl.modify(|_, w| unsafe { w.samplen().bits(0) }); //sample length
     wait_for_adc_sync(&adc);
 
     adc.avgctrl.modify(|_, w| {
-        w.samplenum()._4();
-        unsafe { w.adjres().bits(1) }
+        w.samplenum()._16()
     });
 
     adc.refctrl.modify(|_, w| w.refsel().intvcc1() ); // 1/2 VDDANA
