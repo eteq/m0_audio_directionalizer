@@ -203,7 +203,8 @@ fn main() -> ! {
                     neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 2).unwrap();
 
                     let mut pages_written = 0usize;
-                    while right_button.is_high().unwrap() {
+                    let mut button_counts = -10isize;  //negative means it has to be low that long
+                    while button_counts < 10 && pages_written < 8191 {  // leave page 0 for the metadata
 
                         let whichdata: usize;
                         unsafe {
@@ -247,7 +248,11 @@ fn main() -> ! {
                             pages_written += 1;
 
                         }
-
+                        if button_counts < 0 {
+                            if right_button.is_low().unwrap() { button_counts += 1; }
+                        } else {
+                            if right_button.is_high().unwrap() { button_counts += 1; }
+                        }
                         delay.delay_ms(1u16);
                     }
                     
@@ -279,8 +284,14 @@ fn main() -> ! {
                     write_message(&mut uart, b"Sampling frequency:");
                     write_message_line(&mut uart, (freqeff as u32).numtoa(10, &mut numtoascratch));
 
+                    // let the button come up
+                    button_counts = -10;
+                    while button_counts < 0 { 
+                        if right_button.is_low().unwrap() { button_counts += 1; }
+                        delay.delay_ms(1u16); 
+                    }
                 }
-                delay.delay_ms(100u16); // for debouncing
+                delay.delay_ms(20u16); // for debouncing
             }
         } else {
             // writeback mode
