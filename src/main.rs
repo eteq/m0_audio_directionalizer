@@ -23,6 +23,11 @@ use hal::gpio::v2 as gpio;
 
 use pac::{CorePeripherals, Peripherals, interrupt};
 
+use usb_device::bus::UsbBusAllocator;
+use usb_device::prelude::*;
+use usbd_serial::{SerialPort, USB_CLASS_CDC, UsbError};
+use bsp::hal::usb::UsbBus;
+
 use smart_leds::{
     RGB,
     hsv::{hsv2rgb, Hsv},
@@ -68,24 +73,37 @@ fn main() -> ! {
     let rtc = hal::rtc::Rtc::count32_mode(peripherals.RTC, rtc_clock.freq(), &mut peripherals.PM);
     
 
-    // Setup UART peripheral.
-    let mut uart = bsp::uart(
-        &mut clocks,
-        460800.hz(),
-        peripherals.SERCOM4,
-        &mut peripherals.PM,
-        pins.a6,
-        pins.a7,
-    );
+    // set up USB
+    unsafe {
+        USB_ALLOCATOR = Some(bsp::usb_allocator(
+            peripherals.USB,
+            &mut clocks,
+            &mut peripherals.PM,
+            pins.usb_dm,
+            pins.usb_dp,
+        ));
+        let bus_allocator = USB_ALLOCATOR.as_ref().unwrap();
+
+        USB_SERIAL = Some(SerialPort::new(&bus_allocator));
+        USB_BUS = Some(
+            UsbDeviceBuilder::new(&bus_allocator, UsbVidPid(0x16c0, 0x27dd))
+                .manufacturer("Fake company")
+                .product("Serial port")
+                .serial_number("TEST")
+                .device_class(USB_CLASS_CDC)
+                .build(),
+        );
+
+        corep.NVIC.set_priority(interrupt::USB, 1);
+        NVIC::unmask(interrupt::USB);
+    }
 
 
-    // Check if there was a panic message, if so, send to UART
+    // Check if there was a panic message, if so, send to USB serial
     if let Some(msg) = panic_persist::get_panic_message_bytes() {
         loop {
-            for byte in msg {
-                block!(uart.write(*byte)).ok();
-            }
-            write_message_line(&mut uart, b"\rreset to stop showing this");
+            write_message(msg);
+            write_message_line(b"\rreset to stop showing this");
             delay.delay_ms(1000u16);
         }
     }
@@ -134,7 +152,7 @@ fn main() -> ! {
         * neopixels yellow for record mode if slide is 0, green if slide is 1
         * if in record mode, left button triggers chip erase -> white neopixels until done.
         * if in record mode, right button triggers record -> blue neopixels
-        * if in green mode, either button triggers data dump over uart -> magenta neopixels
+        * if in green mode, either button triggers data dump -> magenta neopixels
 
         plan on ~ 20ksamp / sec, 16-bit samples x 2 -> 32-bit samples, 80 kB/sec, well within the 365 kB/s limit 
         https://blog.thea.codes/getting-the-most-out-of-the-samd21-adc/ gives timing calcs.  To get 22.05 kHz per channel:
@@ -170,22 +188,22 @@ fn main() -> ! {
                 // chip erase
                 neopixel_hue(&mut neopixel, &[0_u8; NPIX], 0, 2).unwrap();
 
-                write_message_line(&mut uart, b"starting flash erase");
+                write_message_line(b"starting flash erase");
                 flash_command(&mut flash_spi, &mut flash_cs, 0x06, -1); // write enable
                 flash_command(&mut flash_spi, &mut flash_cs, 0x60, -1); //chip erase
                 wait_for_flash(&mut flash_spi, &mut flash_cs);
-                write_message_line(&mut uart, b"flash erased!");
+                write_message_line(b"flash erased!");
             }
             if right_button.is_high().unwrap() {
                 //record!
 
                 if !is_page_erased(&mut flash_spi, &mut flash_cs, 0) {
                     neopixel_hue(&mut neopixel, &[0_u8; NPIX], 255, 2).unwrap();
-                    write_message_line(&mut uart, b"cannot record - flash not empty!");
+                    write_message_line(b"cannot record - flash not empty!");
                     while right_button.is_high().unwrap() { }
                 } else {
                     neopixel_hue(&mut neopixel, &[170_u8; NPIX], 255, 2).unwrap();
-                    write_message_line(&mut uart, b"starting recording");
+                    write_message_line(b"starting recording");
                     
                     // reset the global state before starting the interrupt
                     unsafe { 
@@ -275,14 +293,14 @@ fn main() -> ! {
                                                 ];
                     flash_write_page(&mut flash_spi, &mut flash_cs, 0, &write_buffer);
 
-                    write_message_line(&mut uart, b"Recording completed.");
-                    write_message(&mut uart, b"kB written:");
-                    write_message_line(&mut uart, (pages_written/4).numtoa(10, &mut numtoascratch));
-                    write_message(&mut uart, b"Number of overruns:");
-                    write_message_line(&mut uart, no.numtoa(10, &mut numtoascratch));
+                    write_message_line(b"Recording completed.");
+                    write_message(b"kB written:");
+                    write_message_line((pages_written/4).numtoa(10, &mut numtoascratch));
+                    write_message(b"Number of overruns:");
+                    write_message_line(no.numtoa(10, &mut numtoascratch));
 
-                    write_message(&mut uart, b"Sampling frequency:");
-                    write_message_line(&mut uart, (freqeff as u32).numtoa(10, &mut numtoascratch));
+                    write_message(b"Sampling frequency:");
+                    write_message_line((freqeff as u32).numtoa(10, &mut numtoascratch));
 
                     // let the button come up
                     button_counts = -10;
@@ -296,8 +314,11 @@ fn main() -> ! {
         } else {
             // writeback mode
             neopixel_hue(&mut neopixel, &[82_u8; NPIX], 255, 2).unwrap();
-            if left_button.is_high().unwrap() || right_button.is_high().unwrap() {
-                // dump flash to uart - magenta
+            let dosize = unsafe { SIZE_TRIGGER };
+            let doread = left_button.is_high().unwrap() || right_button.is_high().unwrap() || unsafe { READ_TRIGGER };
+            
+            if doread || dosize {
+                // dump flash - magenta
                 neopixel_hue(&mut neopixel, &[215_u8; NPIX], 255, 2).unwrap();
 
                 // read first two bytes to work out how many bytes to read
@@ -316,40 +337,94 @@ fn main() -> ! {
                 flash_cs.set_high().expect("failed to set flash cs pin high");
 
                 //let nbytes = 2*1024*1024;
-                let npages: isize = (nbytes2 as isize) + ((nbytes1 as isize) << 8);
+                let npages: usize = (nbytes2 as usize) + ((nbytes1 as usize) << 8);
                 let nbytes = npages*256;
 
-                // these are useful for debugging, but get in the way of dumping to disk
-                //write_message(&mut uart, b"Reading back ");
-                //write_message(&mut uart, nbytes.numtoa(10, &mut numtoascratch));
-                //write_message_line(&mut uart, b" bytes");
-
-                flash_cs.set_low().expect("failed to set flash cs pin low");
-            
-                block!(flash_spi.send(0x03)).expect("flash send failed");
-                block!(flash_spi.read()).expect("flash read failed");
-                // address 256, skipping the first page
-                block!(flash_spi.send(0)).expect("flash send failed");
-                block!(flash_spi.read()).expect("flash read failed");
-                block!(flash_spi.send(1)).expect("flash send failed");
-                block!(flash_spi.read()).expect("flash read failed");
-                block!(flash_spi.send(0)).expect("flash send failed");
-                block!(flash_spi.read()).expect("flash read failed");
-                
-                
-                for _ in 0..nbytes {
-                    let byte_to_transfer: u8;
-
-                    block!(flash_spi.send(1)).expect("flash send failed");
-                    byte_to_transfer = block!(flash_spi.read()).expect("flash read failed");
-                    block!(uart.write(byte_to_transfer)).expect("uart write failed");
+                if dosize {
+                    write_message_line(nbytes.numtoa(10, &mut numtoascratch));
+                    unsafe { SIZE_TRIGGER = false; }
                 }
-            
-                flash_cs.set_high().expect("failed to set flash cs pin high");
-            }
+
+                if doread {
+                    flash_cs.set_low().expect("failed to set flash cs pin low");
+                
+                    block!(flash_spi.send(0x03)).expect("flash send failed");
+                    block!(flash_spi.read()).expect("flash read failed");
+                    // address 256, skipping the first page
+                    block!(flash_spi.send(0)).expect("flash send failed");
+                    block!(flash_spi.read()).expect("flash read failed");
+                    block!(flash_spi.send(1)).expect("flash send failed");
+                    block!(flash_spi.read()).expect("flash read failed");
+                    block!(flash_spi.send(0)).expect("flash send failed");
+                    block!(flash_spi.read()).expect("flash read failed");
+                    
+                    
+                    let mut send_buffer = [0u8; 128];
+                    for i in 0..nbytes {
+                        let byte_to_transfer: u8;
+
+                        block!(flash_spi.send(1)).expect("flash send failed");
+                        byte_to_transfer = block!(flash_spi.read()).expect("flash read failed");
+                        //block!(uart.write(byte_to_transfer)).expect("uart write failed");
+                        send_buffer[i%128] = byte_to_transfer;
+                        if i%128 == 127 {
+                            write_message(&send_buffer);
+                        }
+                    }
+                    // also manage the tail of the buffer that was read but not written let
+                    if nbytes%128 != 0 {
+                        write_message(&send_buffer[0..(nbytes%128)]);
+                    }
+                
+                    flash_cs.set_high().expect("failed to set flash cs pin high");
+
+                    unsafe { READ_TRIGGER = false; }
+                }
+            } 
         }
         delay.delay_ms(5u16);
     }
+}
+
+
+static mut USB_ALLOCATOR: Option<UsbBusAllocator<UsbBus>> = None;
+static mut USB_BUS: Option<UsbDevice<UsbBus>> = None;
+static mut USB_SERIAL: Option<SerialPort<UsbBus>> = None;
+static mut READ_TRIGGER: bool = false;
+static mut SIZE_TRIGGER: bool = false;
+
+static mut LAST_CHAR_USB: u8 = b'0';
+
+#[interrupt]
+fn USB() {
+    unsafe {
+        USB_BUS.as_mut().map(|usb_dev| {
+            USB_SERIAL.as_mut().map(|serial| {
+                usb_dev.poll(&mut [serial]);
+                let mut buf = [0u8; 64];
+
+                if let Ok(count) = serial.read(&mut buf) {
+                    // data present
+
+                    for (i, c) in buf.iter().enumerate() {
+                        if i >= count {
+                            break;
+                        }
+                        // uncomment this to echo back
+                        //serial.write(&[c.clone()]).ok();
+                        if *c == b'\n' || *c == b'\r' {
+                            match LAST_CHAR_USB {
+                                b'r' => { READ_TRIGGER = true; },
+                                b's' => { SIZE_TRIGGER = true; },
+                                 _ => {}
+                            }
+                        } 
+                        LAST_CHAR_USB = *c;
+                    }
+                };
+            });
+        });
+    };
 }
 
 
@@ -418,16 +493,21 @@ fn neopixel_hue<S: SmartLedsWrite>(neopixel: &mut S, huearr: &[u8; NPIX], sat: u
 
 
 
-fn write_message(uart: &mut bsp::Uart, msg: &[u8]) {
-    for byte in msg {
-        block!(uart.write(*byte)).expect("uart writing failed");
+fn write_message(msg: &[u8]) {
+    let serial = unsafe { USB_SERIAL.as_mut().unwrap() };
+    let mut written: usize = 0;
+    while written < msg.len() {
+        match serial.write(msg) {
+            Err(UsbError::WouldBlock) => { },  // keep trying
+            Err(_err) => { panic!("USB error"); }
+            Ok(count) => { written += count; }
+        }
     }
 }
 
-fn write_message_line(uart: &mut bsp::Uart, msg: &[u8]) {
-
-    write_message(uart, msg);
-    write_message(uart, b"\r\n");
+fn write_message_line(msg: &[u8]) {
+    write_message(msg);
+    write_message(b"\r\n");
 
 }
 

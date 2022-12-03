@@ -10,6 +10,10 @@ log-time = []
 name = "usb_test"           # The name of the target.
 path = "src/usb_test.rs"    # The source file of the target.
 
+[[bin]]
+name = "m0_audio_directionalizer"           # The name of the target.
+path = "src/main.rs"    # The source file of the target.
+
 [dependencies]
 
 circuit_playground_express = { git = "https://github.com/atsamd-rs/atsamd", features = ["unproven", "usb"]}
